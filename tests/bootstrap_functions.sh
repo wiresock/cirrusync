@@ -64,6 +64,59 @@ test_argument_modes() {
         parse_arguments --update --reconfigure
 }
 
+test_rollback_failure_reporting() {
+    local output=""
+
+    output="$(report_rollback_failure restore-binary 23 2>&1)"
+    [[ "${output}" == \
+        "[cirrusync] WARNING: Rollback step failed: restore-binary (exit 23)" ]] ||
+        fail "rollback diagnostics omitted the safe step identifier or status"
+
+    output="$(report_rollback_failure $'unsafe\nsecret-value' invalid 2>&1)"
+    [[ "${output}" == \
+        "[cirrusync] WARNING: Rollback step failed: unknown" ]] ||
+        fail "rollback diagnostics exposed an unsafe step identifier"
+}
+
+test_new_state_directory_cleanup_is_bounded() {
+    local current_uid=""
+    local status=""
+
+    current_uid="$(id -u)"
+    install -d "${STATE_DIR}"
+    printf 'lock\n' >"${STATE_DIR}/record-0123456789abcdef.lock"
+    chmod 0600 "${STATE_DIR}/record-0123456789abcdef.lock"
+    (
+        id() {
+            if [[ "$1" == -u && "$2" == "${SERVICE_USER}" ]]; then
+                printf '%s\n' "${current_uid}"
+            else
+                command id "$@"
+            fi
+        }
+        remove_new_state_directory
+    ) || fail "rollback rejected the canonical runtime lock"
+    [[ ! -d "${STATE_DIR}" ]] ||
+        fail "rollback retained an otherwise-empty new state directory"
+
+    install -d "${STATE_DIR}"
+    printf 'unexpected\n' >"${STATE_DIR}/unexpected"
+    (
+        id() {
+            if [[ "$1" == -u && "$2" == "${SERVICE_USER}" ]]; then
+                printf '%s\n' "${current_uid}"
+            else
+                command id "$@"
+            fi
+        }
+        remove_new_state_directory
+    ) && fail "rollback removed an unexpected state entry"
+    status="$?"
+    [[ "${status}" == 13 ]] ||
+        fail "unexpected state entries did not return the stable diagnostic status"
+    rm -rf -- "${STATE_DIR}"
+}
+
 test_snapshot_restore() {
     local workspace=""
     workspace="$(mktemp -d)"
@@ -811,6 +864,8 @@ test_repository_history_protection() {
 
 test_repository_validation
 test_argument_modes
+test_rollback_failure_reporting
+test_new_state_directory_cleanup_is_bounded
 test_snapshot_restore
 test_snapshot_restore_failure_is_atomic
 test_nested_mount_rejection

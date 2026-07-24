@@ -110,6 +110,21 @@ warn() {
     printf '[cirrusync] WARNING: %s\n' "$*" >&2
 }
 
+report_rollback_failure() {
+    local step="${1:-unknown}"
+    local status="${2:-}"
+
+    case "${step}" in
+        "" | *[!0123456789abcdefghijklmnopqrstuvwxyz-]*) step="unknown" ;;
+    esac
+    if [[ "${status}" =~ ^[1-9][0-9]*$ ]]; then
+        warn "Rollback step failed: ${step} (exit ${status})" || true
+    else
+        warn "Rollback step failed: ${step}" || true
+    fi
+    return 0
+}
+
 die() {
     printf '[cirrusync] ERROR: %s\n' "$*" >&2
     exit 1
@@ -291,6 +306,7 @@ rollback_transaction() {
     local expected_restarts=""
     local failed_source=""
     local retain_new_service_identity=false
+    local rollback_status=""
 
     [[ "${TRANSACTION_ACTIVE}" == true ]] || return 0
     warn "Installation did not complete; restoring the last-known-good files and service state"
@@ -309,19 +325,41 @@ rollback_transaction() {
         fi
     fi
 
-    restore_snapshot "${TOKEN_PATH}" token || rollback_failed=true
-    restore_snapshot "${CONFIG_PATH}" config || rollback_failed=true
-    restore_snapshot "${BINARY_PATH}" binary || rollback_failed=true
-    restore_snapshot "${UNIT_PATH}" unit || rollback_failed=true
-    restore_snapshot "${UNIT_OVERRIDE_PATH}" override || rollback_failed=true
+    restore_snapshot "${TOKEN_PATH}" token || {
+        report_rollback_failure restore-token "$?"
+        rollback_failed=true
+    }
+    restore_snapshot "${CONFIG_PATH}" config || {
+        report_rollback_failure restore-config "$?"
+        rollback_failed=true
+    }
+    restore_snapshot "${BINARY_PATH}" binary || {
+        report_rollback_failure restore-binary "$?"
+        rollback_failed=true
+    }
+    restore_snapshot "${UNIT_PATH}" unit || {
+        report_rollback_failure restore-unit "$?"
+        rollback_failed=true
+    }
+    restore_snapshot "${UNIT_OVERRIDE_PATH}" override || {
+        report_rollback_failure restore-unit-override "$?"
+        rollback_failed=true
+    }
     if [[ "${UNIT_OVERRIDE_DIR_HAD_EXISTING}" == true ]]; then
-        mkdir -p -- "${UNIT_OVERRIDE_DIR}" || rollback_failed=true
+        mkdir -p -- "${UNIT_OVERRIDE_DIR}" || {
+            report_rollback_failure restore-unit-override-dir "$?"
+            rollback_failed=true
+        }
         IFS=: read -r directory_uid directory_gid directory_mode \
             <<<"${UNIT_OVERRIDE_DIR_METADATA}"
-        chown "${directory_uid}:${directory_gid}" "${UNIT_OVERRIDE_DIR}" ||
+        chown "${directory_uid}:${directory_gid}" "${UNIT_OVERRIDE_DIR}" || {
+            report_rollback_failure restore-unit-override-dir-owner "$?"
             rollback_failed=true
-        chmod "${directory_mode}" "${UNIT_OVERRIDE_DIR}" ||
+        }
+        chmod "${directory_mode}" "${UNIT_OVERRIDE_DIR}" || {
+            report_rollback_failure restore-unit-override-dir-mode "$?"
             rollback_failed=true
+        }
     else
         rmdir --ignore-fail-on-non-empty "${UNIT_OVERRIDE_DIR}" \
             >/dev/null 2>&1 || true
@@ -330,35 +368,52 @@ rollback_transaction() {
     if [[ -n "${SOURCE_BACKUP}" && -e "${SOURCE_BACKUP}" ]]; then
         failed_source="${SOURCE_DIR}.failed.${BASHPID}"
         if [[ -e "${failed_source}" || -L "${failed_source}" ]]; then
+            report_rollback_failure preserve-failed-source
             rollback_failed=true
         elif [[ -e "${SOURCE_DIR}" || -L "${SOURCE_DIR}" ]] &&
             ! mv -- "${SOURCE_DIR}" "${failed_source}"; then
+            report_rollback_failure preserve-failed-source
             rollback_failed=true
         elif mv -- "${SOURCE_BACKUP}" "${SOURCE_DIR}"; then
             SOURCE_BACKUP=""
             if [[ -e "${failed_source}" || -L "${failed_source}" ]]; then
-                rm -rf -- "${failed_source}" || rollback_failed=true
+                rm -rf -- "${failed_source}" || {
+                    report_rollback_failure remove-failed-source "$?"
+                    rollback_failed=true
+                }
             fi
         else
+            report_rollback_failure restore-source
             rollback_failed=true
             if [[ -e "${failed_source}" || -L "${failed_source}" ]]; then
-                mv -- "${failed_source}" "${SOURCE_DIR}" ||
+                mv -- "${failed_source}" "${SOURCE_DIR}" || {
+                    report_rollback_failure recover-failed-source "$?"
                     rollback_failed=true
+                }
             fi
         fi
     elif [[ "${SOURCE_HAD_EXISTING}" == false &&
         -n "${STAGED_SOURCE}" && "${STAGED_SOURCE}" == "${SOURCE_DIR}" ]]; then
-        rm -rf -- "${SOURCE_DIR}" || rollback_failed=true
+        rm -rf -- "${SOURCE_DIR}" || {
+            report_rollback_failure remove-new-source "$?"
+            rollback_failed=true
+        }
     fi
 
     if [[ "${CONFIG_DIR_HAD_EXISTING}" == true ]]; then
         IFS=: read -r directory_uid directory_gid directory_mode \
             <<<"${CONFIG_DIR_METADATA}"
-        chown "${directory_uid}:${directory_gid}" "${CONFIG_DIR}" ||
+        chown "${directory_uid}:${directory_gid}" "${CONFIG_DIR}" || {
+            report_rollback_failure restore-config-dir-owner "$?"
             rollback_failed=true
-        chmod "${directory_mode}" "${CONFIG_DIR}" || rollback_failed=true
+        }
+        chmod "${directory_mode}" "${CONFIG_DIR}" || {
+            report_rollback_failure restore-config-dir-mode "$?"
+            rollback_failed=true
+        }
     elif [[ -d "${CONFIG_DIR}" ]] &&
         ! rmdir --ignore-fail-on-non-empty "${CONFIG_DIR}" 2>/dev/null; then
+        report_rollback_failure remove-new-config-dir
         rollback_failed=true
     fi
     if [[ "${STATE_DIR_HAD_EXISTING}" == true ]]; then
@@ -367,13 +422,23 @@ rollback_transaction() {
         fi
         IFS=: read -r directory_uid directory_gid directory_mode \
             <<<"${STATE_DIR_METADATA}"
-        chown "${directory_uid}:${directory_gid}" "${STATE_DIR}" ||
+        chown "${directory_uid}:${directory_gid}" "${STATE_DIR}" || {
+            report_rollback_failure restore-state-dir-owner "$?"
             rollback_failed=true
-        chmod "${directory_mode}" "${STATE_DIR}" || rollback_failed=true
-    elif [[ -d "${STATE_DIR}" ]] &&
-        ! remove_new_state_directory; then
-        rollback_failed=true
-        retain_new_service_identity=true
+        }
+        chmod "${directory_mode}" "${STATE_DIR}" || {
+            report_rollback_failure restore-state-dir-mode "$?"
+            rollback_failed=true
+        }
+    elif [[ -d "${STATE_DIR}" ]]; then
+        if remove_new_state_directory; then
+            :
+        else
+            rollback_status="$?"
+            report_rollback_failure remove-new-state-dir "${rollback_status}"
+            rollback_failed=true
+            retain_new_service_identity=true
+        fi
     fi
 
     if [[ "${SERVICE_USER_HAD_EXISTING}" == false &&
@@ -384,8 +449,12 @@ rollback_transaction() {
             validate_local_system_user \
                 "${SERVICE_USER}" "${SERVICE_GROUP}" "${STATE_DIR}"
         ); then
-            userdel "${SERVICE_USER}" || rollback_failed=true
+            userdel "${SERVICE_USER}" || {
+                report_rollback_failure delete-new-service-user "$?"
+                rollback_failed=true
+            }
         else
+            report_rollback_failure validate-new-service-user
             rollback_failed=true
         fi
     fi
@@ -393,29 +462,51 @@ rollback_transaction() {
         "${retain_new_service_identity}" == false ]] &&
         getent group "${SERVICE_GROUP}" >/dev/null 2>&1; then
         if (validate_local_system_group "${SERVICE_GROUP}"); then
-            groupdel "${SERVICE_GROUP}" || rollback_failed=true
+            groupdel "${SERVICE_GROUP}" || {
+                report_rollback_failure delete-new-service-group "$?"
+                rollback_failed=true
+            }
         else
+            report_rollback_failure validate-new-service-group
             rollback_failed=true
         fi
     fi
 
     if systemd_is_running; then
-        systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
-        restore_service_enablement "${SERVICE_WAS_ENABLED}" ||
+        systemctl daemon-reload >/dev/null 2>&1 || {
+            report_rollback_failure systemd-daemon-reload "$?"
             rollback_failed=true
+        }
+        restore_service_enablement "${SERVICE_WAS_ENABLED}" || {
+            report_rollback_failure restore-service-enablement "$?"
+            rollback_failed=true
+        }
         if [[ "${SERVICE_WAS_ACTIVE}" == true &&
             "${rollback_failed}" == false ]]; then
             systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
             expected_restarts="$(systemctl show --property=NRestarts --value \
-                "${SERVICE_NAME}" 2>/dev/null)" || rollback_failed=true
+                "${SERVICE_NAME}" 2>/dev/null)" || {
+                report_rollback_failure inspect-prior-service-restarts "$?"
+                rollback_failed=true
+            }
             if [[ "${expected_restarts}" =~ ^[0-9]+$ ]]; then
-                if ! systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 ||
-                    ! service_remains_healthy 5 "${expected_restarts}"; then
+                if ! systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1; then
+                    report_rollback_failure restart-prior-service
                     rollback_failed=true
-                    quiesce_failed_service ||
+                    quiesce_failed_service || {
+                        report_rollback_failure quiesce-failed-service "$?"
                         rollback_failed=true
+                    }
+                elif ! service_remains_healthy 5 "${expected_restarts}"; then
+                    report_rollback_failure verify-restarted-service
+                    rollback_failed=true
+                    quiesce_failed_service || {
+                        report_rollback_failure quiesce-failed-service "$?"
+                        rollback_failed=true
+                    }
                 fi
             else
+                report_rollback_failure inspect-prior-service-restarts
                 rollback_failed=true
             fi
         elif [[ "${SERVICE_WAS_ACTIVE}" == true ]]; then
@@ -881,23 +972,24 @@ remove_new_state_directory() (
     local -a entries=()
 
     [[ "${STATE_DIR}" == "${BOOTSTRAP_ROOT}/var/lib/cirrusync" &&
-        -d "${STATE_DIR}" && ! -L "${STATE_DIR}" ]] || return 1
-    service_uid="$(id -u "${SERVICE_USER}")" || return 1
-    [[ "$(stat -c '%u' "${STATE_DIR}")" == "${service_uid}" ]] || return 1
+        -d "${STATE_DIR}" && ! -L "${STATE_DIR}" ]] || return 10
+    service_uid="$(id -u "${SERVICE_USER}")" || return 11
+    [[ "$(stat -c '%u' "${STATE_DIR}")" == "${service_uid}" ]] || return 12
 
     shopt -s nullglob dotglob
     entries=("${STATE_DIR}"/*)
     for entry in "${entries[@]}"; do
         name="${entry##*/}"
-        [[ "${name}" =~ ^record-[0-9a-f]{16}\.lock$ ]] || return 1
+        [[ "${name}" =~ ^record-[0-9a-f]{16}\.lock$ ]] || return 13
         [[ -f "${entry}" && ! -L "${entry}" &&
             "$(stat -c '%u' "${entry}")" == "${service_uid}" &&
-            "$(stat -c '%h' "${entry}")" == 1 ]] || return 1
-        mode="$(stat -c '%a' "${entry}")"
-        (( (8#${mode} & 0077) == 0 )) || return 1
-        rm -f -- "${entry}" || return 1
+            "$(stat -c '%h' "${entry}")" == 1 ]] || return 14
+        mode="$(stat -c '%a' "${entry}")" || return 15
+        [[ "${mode}" =~ ^[0-7]{3,4}$ ]] || return 15
+        (( (8#${mode} & 0077) == 0 )) || return 16
+        rm -f -- "${entry}" || return 17
     done
-    rmdir -- "${STATE_DIR}"
+    rmdir -- "${STATE_DIR}" || return 18
 )
 
 refuse_mount_point() {
