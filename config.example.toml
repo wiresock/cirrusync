@@ -1,0 +1,40 @@
+# How often the daemon checks Cloudflare, in seconds.
+interval_seconds = 300
+# HTTP request timeout in seconds; allowed range: 1 through 120.
+request_timeout_seconds = 15
+
+[cloudflare]
+# Keep the token out of this file. The service account must be able to read the
+# token file; the installer uses root:cirrusync ownership and mode 0640.
+api_token_file = "/etc/cirrusync/token"
+
+[ipv4]
+enabled = true
+providers = [
+    "https://api.cloudflare.com/cdn-cgi/trace",
+    "https://api.ipify.org",
+]
+
+[ipv6]
+enabled = false
+providers = [
+    "https://api6.ipify.org",
+]
+
+[[records]]
+zone = "example.com"
+# zone_id = "0123456789abcdef0123456789abcdef"
+name = "home.example.com"
+type = "A"
+ttl = 120
+proxied = false
+create_if_missing = false
+
+# Enable [ipv6] before adding an AAAA record.
+# [[records]]
+# zone = "example.com"
+# name = "home.example.com"
+# type = "AAAA"
+# ttl = 120
+# proxied = false
+# create_if_missing = false

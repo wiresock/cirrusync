@@ -1,0 +1,8 @@
+/target/
+/config.toml
+/token
+/.env
+*.swp
+*.tmp
+.idea/
+.vscode/

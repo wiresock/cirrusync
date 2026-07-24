@@ -1,0 +1,58 @@
+[Unit]
+Description=Cirrusync Cloudflare Dynamic DNS client
+Documentation=https://github.com/wiresock/cirrusync
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=cirrusync
+Group=cirrusync
+WorkingDirectory=/var/lib/cirrusync
+ExecStart=/usr/local/bin/cirrusync --config /etc/cirrusync/config.toml run
+Environment=RUST_LOG=cirrusync=info
+Restart=on-failure
+RestartSec=10
+# The daemon waits for a bounded in-flight HTTP mutation before exiting. Keep
+# this above the maximum accepted request timeout (120 seconds).
+TimeoutStopSec=150
+KillSignal=SIGTERM
+UMask=0027
+
+# The daemon needs outbound DNS and HTTPS, but no elevated privileges or broad
+# filesystem access. Keep network namespaces and AF_INET/AF_INET6 available.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+KeyringMode=private
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+StateDirectory=cirrusync
+StateDirectoryMode=0750
+ReadOnlyPaths=-/etc/cirrusync
+ReadWritePaths=/var/lib/cirrusync
+
+[Install]
+WantedBy=multi-user.target
