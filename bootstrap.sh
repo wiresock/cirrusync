@@ -209,7 +209,7 @@ restore_snapshot() {
 
     if [[ ! -e "${ROLLBACK_DIR}/${key}.present" ]]; then
         rm -f -- "${path}"
-        return
+        return 0
     fi
 
     mkdir -p -- "$(dirname -- "${path}")" || return 1
@@ -454,7 +454,7 @@ rollback_transaction() {
                 rollback_failed=true
             }
         else
-            report_rollback_failure validate-new-service-user
+            report_rollback_failure validate-new-service-identity
             rollback_failed=true
         fi
     fi
@@ -484,29 +484,31 @@ rollback_transaction() {
         if [[ "${SERVICE_WAS_ACTIVE}" == true &&
             "${rollback_failed}" == false ]]; then
             systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
-            expected_restarts="$(systemctl show --property=NRestarts --value \
-                "${SERVICE_NAME}" 2>/dev/null)" || {
-                report_rollback_failure inspect-prior-service-restarts "$?"
-                rollback_failed=true
-            }
-            if [[ "${expected_restarts}" =~ ^[0-9]+$ ]]; then
-                if ! systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1; then
-                    report_rollback_failure restart-prior-service
-                    rollback_failed=true
-                    quiesce_failed_service || {
-                        report_rollback_failure quiesce-failed-service "$?"
+            if expected_restarts="$(systemctl show \
+                --property=NRestarts --value \
+                "${SERVICE_NAME}" 2>/dev/null)"; then
+                if [[ "${expected_restarts}" =~ ^[0-9]+$ ]]; then
+                    if ! systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1; then
+                        report_rollback_failure restart-prior-service
                         rollback_failed=true
-                    }
-                elif ! service_remains_healthy 5 "${expected_restarts}"; then
-                    report_rollback_failure verify-restarted-service
-                    rollback_failed=true
-                    quiesce_failed_service || {
-                        report_rollback_failure quiesce-failed-service "$?"
+                        quiesce_failed_service || {
+                            report_rollback_failure quiesce-failed-service "$?"
+                            rollback_failed=true
+                        }
+                    elif ! service_remains_healthy 5 "${expected_restarts}"; then
+                        report_rollback_failure verify-restarted-service
                         rollback_failed=true
-                    }
+                        quiesce_failed_service || {
+                            report_rollback_failure quiesce-failed-service "$?"
+                            rollback_failed=true
+                        }
+                    fi
+                else
+                    report_rollback_failure inspect-prior-service-restarts
+                    rollback_failed=true
                 fi
             else
-                report_rollback_failure inspect-prior-service-restarts
+                report_rollback_failure inspect-prior-service-restarts "$?"
                 rollback_failed=true
             fi
         elif [[ "${SERVICE_WAS_ACTIVE}" == true ]]; then
@@ -879,7 +881,7 @@ read_service_activity() {
         "${SERVICE_NAME}" 2>/dev/null)" || return 1
     if [[ "${load_state}" == not-found ]]; then
         printf '%s' inactive
-        return
+        return 0
     fi
     [[ -n "${load_state}" ]] || return 1
     active_state="$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null)" || true

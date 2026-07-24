@@ -164,6 +164,55 @@ test_snapshot_restore_failure_is_atomic() {
     rm -rf -- "${workspace}"
 }
 
+test_cleanup_helpers_do_not_inherit_exit_trap_status() {
+    local workspace=""
+    workspace="$(mktemp -d)"
+    (
+        local activity=""
+        local activity_status=""
+        local restore_status=""
+
+        ROLLBACK_DIR="${workspace}/rollback"
+        mkdir "${ROLLBACK_DIR}"
+        printf 'temporary\n' >"${workspace}/managed"
+        systemctl() {
+            if [[ "$1" == show ]]; then
+                printf 'not-found\n'
+                return 0
+            fi
+            return 1
+        }
+        cleanup_probe() {
+            trap - ERR
+            set +e
+            restore_snapshot "${workspace}/managed" absent
+            restore_status="$?"
+            activity="$(read_service_activity)"
+            activity_status="$?"
+            {
+                printf 'restore=%s\n' "${restore_status}"
+                printf 'activity=%s\n' "${activity_status}"
+                printf 'state=%s\n' "${activity}"
+            } >"${workspace}/status"
+        }
+        trap cleanup_probe EXIT
+        false
+    ) && {
+        rm -rf -- "${workspace}"
+        fail "the exit-trap regression probe unexpectedly succeeded"
+    }
+    [[ "$(cat "${workspace}/status")" == \
+        $'restore=0\nactivity=0\nstate=inactive' ]] || {
+        rm -rf -- "${workspace}"
+        fail "cleanup helpers inherited the original exit-trap status"
+    }
+    [[ ! -e "${workspace}/managed" ]] || {
+        rm -rf -- "${workspace}"
+        fail "exit-trap snapshot cleanup did not remove the new file"
+    }
+    rm -rf -- "${workspace}"
+}
+
 test_nested_mount_rejection() {
     local workspace=""
     workspace="$(mktemp -d)"
@@ -868,6 +917,7 @@ test_rollback_failure_reporting
 test_new_state_directory_cleanup_is_bounded
 test_snapshot_restore
 test_snapshot_restore_failure_is_atomic
+test_cleanup_helpers_do_not_inherit_exit_trap_status
 test_nested_mount_rejection
 test_service_health_sampling
 test_empty_account_process_list_is_successful
