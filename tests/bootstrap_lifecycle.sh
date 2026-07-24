@@ -79,13 +79,13 @@ restore_toolchain_entry() {
     local link_attempted="$3"
 
     if [[ "${link_attempted}" != true ]]; then
-        return
+        return 0
     fi
     if [[ ! -L "${link_path}" ||
         "$(readlink -- "${link_path}" 2>/dev/null)" != \
         "${expected_target}" ]]; then
         fail "temporary toolchain link changed unexpectedly: ${link_path}"
-        return
+        return 1
     fi
     "${SUDO[@]}" rm -f -- "${link_path}"
 }
@@ -101,42 +101,42 @@ normalize_managed_parent_directory() {
     [[ "${path}" == /usr/local/bin || "${path}" == /usr/local/src ]] ||
         {
             fail "refusing to normalize an unexpected directory: ${path}"
-            return
+            return 1
         }
     for component in /usr /usr/local "${path}"; do
         [[ -d "${component}" && ! -L "${component}" ]] ||
             {
                 fail "managed parent component is not a real directory: ${component}"
-                return
+                return 1
             }
-        uid="$(stat -c '%u' -- "${component}")" || return
+        uid="$(stat -c '%u' -- "${component}")" || return 1
         [[ "${uid}" == 0 ]] ||
             {
                 fail "managed parent component is not owned by root: ${component}"
-                return
+                return 1
             }
     done
 
-    parent_mode="$(stat -c '%a' -- "${path%/*}")" || return
+    parent_mode="$(stat -c '%a' -- "${path%/*}")" || return 1
     [[ "${parent_mode}" =~ ^[0-7]{3,4}$ ]] ||
         {
             fail "managed parent has an invalid mode: ${path%/*}"
-            return
+            return 1
         }
     (( (8#${parent_mode} & 0022) == 0 )) ||
         {
             fail "managed parent is writable by group or other users: ${path%/*}"
-            return
+            return 1
         }
 
-    mode="$(stat -c '%a' -- "${path}")" || return
+    mode="$(stat -c '%a' -- "${path}")" || return 1
     [[ "${mode}" =~ ^[0-7]{3,4}$ ]] ||
         {
             fail "managed directory has an invalid mode: ${path}"
-            return
+            return 1
         }
     printf -v normalized_mode '%o' "$((8#${mode} & 07755))"
-    [[ "${normalized_mode}" != "${mode}" ]] || return
+    [[ "${normalized_mode}" != "${mode}" ]] || return 0
 
     case "${path}" in
         /usr/local/bin)
@@ -157,7 +157,7 @@ normalize_managed_parent_directory() {
         "$(stat -c '%a' -- "${path}")" == "${normalized_mode}" ]] ||
         {
             fail "could not safely normalize managed directory: ${path}"
-            return
+            return 1
         }
 }
 
@@ -168,33 +168,33 @@ restore_managed_parent_mode() {
     local change_attempted="$4"
     local current_mode=""
 
-    [[ "${change_attempted}" == true ]] || return
+    [[ "${change_attempted}" == true ]] || return 0
     [[ -d "${path}" && ! -L "${path}" ]] ||
         {
             fail "managed directory changed type before mode restoration: ${path}"
-            return
+            return 1
         }
     [[ "$(stat -c '%u' -- "${path}")" == 0 ]] ||
         {
             fail "managed directory changed owner before mode restoration: ${path}"
-            return
+            return 1
         }
-    current_mode="$(stat -c '%a' -- "${path}")" || return
+    current_mode="$(stat -c '%a' -- "${path}")" || return 1
     if [[ "${current_mode}" == "${original_mode}" ]]; then
-        return
+        return 0
     fi
     [[ "${current_mode}" == "${normalized_mode}" ]] ||
         {
             fail "managed directory mode changed unexpectedly before restoration: ${path}"
-            return
+            return 1
         }
-    "${SUDO[@]}" chmod "${original_mode}" -- "${path}" || return
+    "${SUDO[@]}" chmod "${original_mode}" -- "${path}" || return 1
     [[ -d "${path}" && ! -L "${path}" &&
         "$(stat -c '%u' -- "${path}")" == 0 &&
         "$(stat -c '%a' -- "${path}")" == "${original_mode}" ]] ||
         {
             fail "could not restore the original mode on ${path}"
-            return
+            return 1
         }
 }
 
@@ -213,11 +213,11 @@ service_is_confirmed_stopped() {
             ;;
         active | activating | reloading | deactivating)
             fail "service remained in ${state} state during cleanup"
-            return
+            return 1
             ;;
         *)
             fail "could not confirm that the service stopped (systemctl exit ${status}, state ${state:-<empty>})"
-            return
+            return 1
             ;;
     esac
 }
