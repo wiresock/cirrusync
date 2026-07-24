@@ -545,6 +545,29 @@ test_service_state_queries_fail_closed() {
         systemctl() { return 1; }
         expect_failure "failed systemd enablement query" read_service_enablement
     ) || fail "a failed systemd enablement query was interpreted as disabled"
+
+    (
+        systemctl() {
+            case "$1" in
+                show) printf 'not-found\n' ;;
+                is-enabled) return 1 ;;
+                *) return 1 ;;
+            esac
+        }
+        [[ "$(read_service_enablement)" == disabled ]]
+    ) || fail "an absent unit with empty is-enabled output was not treated as disabled"
+
+    (
+        systemctl() {
+            case "$1" in
+                show) printf 'loaded\n' ;;
+                is-enabled) return 1 ;;
+                *) return 1 ;;
+            esac
+        }
+        expect_failure "empty enablement for a loaded unit" \
+            read_service_enablement
+    ) || fail "a failed enablement query for a loaded unit was accepted"
 }
 
 test_quiesce_uses_account_cleanup_after_stop_failure() {

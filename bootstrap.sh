@@ -898,7 +898,15 @@ read_service_activity() {
 
 read_service_enablement() {
     local enable_state=""
+    local load_state=""
 
+    load_state="$(systemctl show --property=LoadState --value \
+        "${SERVICE_NAME}" 2>/dev/null)" || return 1
+    if [[ "${load_state}" == not-found ]]; then
+        printf '%s' disabled
+        return 0
+    fi
+    [[ -n "${load_state}" ]] || return 1
     enable_state="$(systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null)" || true
     case "${enable_state}" in
         enabled | enabled-runtime | linked | linked-runtime | alias)
