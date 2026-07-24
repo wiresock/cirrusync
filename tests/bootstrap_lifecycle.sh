@@ -16,9 +16,12 @@ readonly TOKEN_VALUE="cirrusync-integration-token"
 readonly CONFIG_DIR="/etc/cirrusync"
 readonly CONFIG_PATH="/etc/cirrusync/config.toml"
 readonly TOKEN_PATH="/etc/cirrusync/token"
+readonly CA_SOURCE_PATH="/usr/local/share/ca-certificates/cirrusync-bootstrap-ci.crt"
+readonly CA_HOOKS_DIR="/run/cirrusync-bootstrap-ci-ca-hooks-${BASHPID}"
 readonly SOURCE_DIR="/usr/local/src/cirrusync"
 readonly BINARY_PATH="/usr/local/bin/cirrusync"
 readonly UNIT_PATH="/etc/systemd/system/cirrusync.service"
+readonly MOCK_UNIT="cirrusync-bootstrap-ci-${BASHPID}.service"
 readonly FSMONITOR_MARKER="/var/tmp/cirrusync-fsmonitor-probe.uid"
 readonly FSMONITOR_PID_FILE="/var/tmp/cirrusync-fsmonitor-probe.pid"
 readonly FSMONITOR_CONTAMINATION="/var/tmp/cirrusync-fsmonitor-contaminated"
@@ -41,7 +44,7 @@ readonly -a SUDO
 
 WORKSPACE="$(mktemp -d)"
 readonly WORKSPACE
-MOCK_PID=""
+MOCK_UNIT_ATTEMPTED=false
 HOSTS_BACKUP="${WORKSPACE}/hosts"
 MOCK_LOG="${WORKSPACE}/https-mock.log"
 TOKEN_SOURCE="/root/cirrusync-integration-token.${BASHPID}"
@@ -55,6 +58,7 @@ LOCAL_SRC_ORIGINAL_MODE=""
 LOCAL_SRC_NORMALIZED_MODE=""
 LOCAL_SRC_MODE_CHANGE_ATTEMPTED=false
 CA_INSTALLED=false
+CA_HOOKS_DIR_ATTEMPTED=false
 HOSTS_CHANGED=false
 
 fail() {
@@ -73,6 +77,17 @@ fail_with_log() {
     fail "${message}"
 }
 
+run_root_bounded() {
+    local duration="$1"
+
+    shift
+    "${SUDO[@]}" timeout \
+        --signal=TERM \
+        --kill-after=2s \
+        "${duration}" \
+        "$@"
+}
+
 restore_toolchain_entry() {
     local link_path="$1"
     local expected_target="$2"
@@ -87,7 +102,7 @@ restore_toolchain_entry() {
         fail "temporary toolchain link changed unexpectedly: ${link_path}"
         return 1
     fi
-    "${SUDO[@]}" rm -f -- "${link_path}"
+    run_root_bounded 10s rm -f -- "${link_path}"
 }
 
 normalize_managed_parent_directory() {
@@ -188,7 +203,7 @@ restore_managed_parent_mode() {
             fail "managed directory mode changed unexpectedly before restoration: ${path}"
             return 1
         }
-    "${SUDO[@]}" chmod "${original_mode}" -- "${path}" || return 1
+    run_root_bounded 10s chmod "${original_mode}" -- "${path}" || return 1
     [[ -d "${path}" && ! -L "${path}" &&
         "$(stat -c '%u' -- "${path}")" == 0 &&
         "$(stat -c '%a' -- "${path}")" == "${original_mode}" ]] ||
@@ -202,7 +217,8 @@ service_is_confirmed_stopped() {
     local state=""
     local status=""
 
-    if state="$("${SUDO[@]}" systemctl is-active cirrusync.service 2>/dev/null)"; then
+    if state="$(run_root_bounded 10s \
+        systemctl is-active cirrusync.service 2>/dev/null)"; then
         status=0
     else
         status="$?"
@@ -222,6 +238,88 @@ service_is_confirmed_stopped() {
     esac
 }
 
+service_is_confirmed_disabled() {
+    local enable_state=""
+    local load_state=""
+    local status=""
+
+    load_state="$(run_root_bounded 10s systemctl show \
+        --property=LoadState --value cirrusync.service 2>/dev/null)" ||
+        return 1
+    if enable_state="$(run_root_bounded 10s \
+        systemctl is-enabled cirrusync.service 2>/dev/null)"; then
+        status=0
+    else
+        status="$?"
+    fi
+    case "${load_state}:${enable_state}" in
+        loaded:disabled | not-found:disabled | not-found:not-found)
+            return 0
+            ;;
+        not-found:)
+            [[ "${status}" == 1 || "${status}" == 4 ]] && return 0
+            ;;
+    esac
+    fail "service remained ${enable_state:-<empty>} with load state ${load_state:-<empty>} during cleanup (systemctl exit ${status})"
+    return 1
+}
+
+stop_and_disable_installed_service() {
+    if ! run_root_bounded 30s systemctl stop \
+        cirrusync.service >/dev/null 2>&1; then
+        run_root_bounded 5s systemctl kill \
+            --kill-who=all \
+            --signal=KILL \
+            cirrusync.service >/dev/null 2>&1 || true
+        run_root_bounded 5s systemctl stop \
+            cirrusync.service >/dev/null 2>&1 || true
+    fi
+    run_root_bounded 10s systemctl disable \
+        cirrusync.service >/dev/null 2>&1 || true
+    run_root_bounded 10s systemctl disable --runtime \
+        cirrusync.service >/dev/null 2>&1 || true
+
+    service_is_confirmed_stopped &&
+        service_is_confirmed_disabled
+}
+
+stop_mock_server() {
+    local active_state=""
+    local load_state=""
+
+    [[ "${MOCK_UNIT_ATTEMPTED}" == true ]] || return 0
+    if ! run_root_bounded 12s systemctl stop "${MOCK_UNIT}" \
+        >/dev/null 2>&1; then
+        run_root_bounded 5s systemctl kill \
+            --kill-who=all \
+            --signal=KILL \
+            "${MOCK_UNIT}" >/dev/null 2>&1 || true
+        run_root_bounded 5s systemctl stop "${MOCK_UNIT}" \
+            >/dev/null 2>&1 || true
+    fi
+
+    load_state="$(run_root_bounded 5s systemctl show \
+        --property=LoadState --value "${MOCK_UNIT}" 2>/dev/null)" ||
+        return 1
+    if [[ "${load_state}" == not-found ]]; then
+        return 0
+    fi
+    [[ "${load_state}" == loaded ]] || return 1
+    active_state="$(run_root_bounded 5s systemctl show \
+        --property=ActiveState --value "${MOCK_UNIT}" 2>/dev/null)" ||
+        return 1
+    case "${active_state}" in
+        inactive | failed)
+            run_root_bounded 5s systemctl reset-failed \
+                "${MOCK_UNIT}" >/dev/null 2>&1 || true
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 cleanup() {
     local exit_code="$?"
     local managed_parent_restore_failed=false
@@ -232,16 +330,18 @@ cleanup() {
     trap '' HUP INT TERM
     set +e
     if ((exit_code != 0)); then
-        "${SUDO[@]}" systemctl --no-pager --full status cirrusync.service >&2
-        "${SUDO[@]}" journalctl --no-pager -u cirrusync.service -n 100 >&2
+        run_root_bounded 10s systemctl \
+            --no-pager --full status cirrusync.service >&2
+        run_root_bounded 10s journalctl \
+            --no-pager -u cirrusync.service -n 100 >&2
         if [[ -f "${MOCK_LOG}" ]]; then
             printf '%s\n' '--- local HTTPS fixture log ---' >&2
             tail -n 200 "${MOCK_LOG}" >&2
         fi
     fi
 
-    "${SUDO[@]}" systemctl disable --now cirrusync.service >/dev/null 2>&1
-    if ! service_is_confirmed_stopped; then
+    printf '[cirrusync-ci] cleanup: stopping installed service\n' >&2
+    if ! stop_and_disable_installed_service; then
         managed_parent_restore_failed=true
     else
         restore_managed_parent_mode \
@@ -261,29 +361,60 @@ cleanup() {
         exit_code=1
     fi
 
-    if [[ -n "${MOCK_PID}" ]]; then
-        "${SUDO[@]}" kill "${MOCK_PID}" >/dev/null 2>&1
-        wait "${MOCK_PID}" >/dev/null 2>&1
-    fi
+    printf '[cirrusync-ci] cleanup: stopping HTTPS fixture\n' >&2
+    stop_mock_server ||
+        {
+            printf 'could not stop the HTTPS fixture\n' >&2
+            exit_code=1
+        }
     if [[ "${HOSTS_CHANGED}" == true ]]; then
-        "${SUDO[@]}" cp -- "${HOSTS_BACKUP}" /etc/hosts
+        printf '[cirrusync-ci] cleanup: restoring /etc/hosts\n' >&2
+        run_root_bounded 10s cp -- "${HOSTS_BACKUP}" /etc/hosts ||
+            exit_code=1
     fi
     if [[ "${CA_INSTALLED}" == true ]]; then
-        "${SUDO[@]}" rm -f -- \
-            /usr/local/share/ca-certificates/cirrusync-bootstrap-ci.crt
-        "${SUDO[@]}" update-ca-certificates --fresh >/dev/null 2>&1
-    fi
-    if "${SUDO[@]}" test -r "${FSMONITOR_PID_FILE}"; then
-        probe_pid="$("${SUDO[@]}" cat "${FSMONITOR_PID_FILE}")"
-        if [[ "${probe_pid}" =~ ^[0-9]+$ ]]; then
-            "${SUDO[@]}" kill "${probe_pid}" >/dev/null 2>&1
+        printf '[cirrusync-ci] cleanup: restoring system trust store\n' >&2
+        run_root_bounded 10s rm -f -- \
+            "${CA_SOURCE_PATH}" \
+            /etc/ssl/certs/cirrusync-bootstrap-ci.pem ||
+            exit_code=1
+        run_root_bounded 10s find /etc/ssl/certs \
+            -maxdepth 1 \
+            -type l \
+            -lname 'cirrusync-bootstrap-ci.pem' \
+            -delete ||
+            exit_code=1
+        # Incremental mode rewrites the bundle without forcing every
+        # distribution-specific trust store to import fixture-only state.
+        run_root_bounded 60s update-ca-certificates \
+            --hooksdir "${CA_HOOKS_DIR}" >/dev/null 2>&1 ||
+            exit_code=1
+        if [[ -e "${CA_SOURCE_PATH}" || -L "${CA_SOURCE_PATH}" ]]; then
+            printf 'temporary CA source remained installed\n' >&2
+            exit_code=1
         fi
     fi
-    "${SUDO[@]}" rm -f -- \
+    if [[ "${CA_HOOKS_DIR_ATTEMPTED}" == true ]]; then
+        run_root_bounded 10s rm -rf -- "${CA_HOOKS_DIR}" ||
+            exit_code=1
+        if [[ -e "${CA_HOOKS_DIR}" || -L "${CA_HOOKS_DIR}" ]]; then
+            printf 'temporary CA hooks directory remained installed\n' >&2
+            exit_code=1
+        fi
+    fi
+    if run_root_bounded 5s test -r "${FSMONITOR_PID_FILE}"; then
+        probe_pid="$(run_root_bounded 5s cat "${FSMONITOR_PID_FILE}")"
+        if [[ "${probe_pid}" =~ ^[0-9]+$ ]]; then
+            run_root_bounded 5s kill "${probe_pid}" >/dev/null 2>&1 ||
+                true
+        fi
+    fi
+    run_root_bounded 10s rm -f -- \
         "${TOKEN_SOURCE}" \
         "${FSMONITOR_MARKER}" \
         "${FSMONITOR_PID_FILE}" \
-        "${FSMONITOR_CONTAMINATION}"
+        "${FSMONITOR_CONTAMINATION}" ||
+        exit_code=1
     restore_toolchain_entry \
         "${TOOLCHAIN_CARGO_LINK}" \
         "${TOOLCHAIN_ROOT}/bin/cargo" \
@@ -300,9 +431,14 @@ cleanup() {
         exit_code=1
     elif [[ "${TOOLCHAIN_ROOT}" == \
         /usr/local/lib/cirrusync-bootstrap-ci.* ]]; then
-        "${SUDO[@]}" rm -rf -- "${TOOLCHAIN_ROOT}"
+        printf '[cirrusync-ci] cleanup: removing toolchain fixture\n' >&2
+        run_root_bounded 120s rm -rf -- "${TOOLCHAIN_ROOT}" ||
+            exit_code=1
     fi
-    rm -rf -- "${WORKSPACE}"
+    printf '[cirrusync-ci] cleanup: removing workspace\n' >&2
+    run_root_bounded 120s rm -rf -- "${WORKSPACE}" ||
+        exit_code=1
+    printf '[cirrusync-ci] cleanup: complete\n' >&2
     exit "${exit_code}"
 }
 trap cleanup EXIT
@@ -397,6 +533,7 @@ prepare_repository() {
 
 prepare_tls_and_hosts() {
     local tls="${WORKSPACE}/tls"
+    local python_path=""
 
     install -d "${tls}"
     openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
@@ -420,25 +557,49 @@ prepare_tls_and_hosts() {
         -extfile "${tls}/server.ext" \
         -out "${tls}/server.crt" >/dev/null 2>&1
 
-    "${SUDO[@]}" install -o root -g root -m 0644 \
-        "${tls}/ca.crt" \
-        /usr/local/share/ca-certificates/cirrusync-bootstrap-ci.crt
-    "${SUDO[@]}" update-ca-certificates >/dev/null
+    [[ ! -e "${CA_HOOKS_DIR}" && ! -L "${CA_HOOKS_DIR}" ]] ||
+        fail "temporary CA hooks path already exists: ${CA_HOOKS_DIR}"
+    CA_HOOKS_DIR_ATTEMPTED=true
+    run_root_bounded 10s install -d -o root -g root -m 0700 \
+        "${CA_HOOKS_DIR}"
+    [[ ! -e "${CA_SOURCE_PATH}" && ! -L "${CA_SOURCE_PATH}" &&
+        ! -e /etc/ssl/certs/cirrusync-bootstrap-ci.pem &&
+        ! -L /etc/ssl/certs/cirrusync-bootstrap-ci.pem ]] ||
+        fail "refusing to replace pre-existing CA fixture state"
     CA_INSTALLED=true
+    run_root_bounded 10s install -o root -g root -m 0644 \
+        "${tls}/ca.crt" \
+        "${CA_SOURCE_PATH}"
+    run_root_bounded 60s update-ca-certificates \
+        --hooksdir "${CA_HOOKS_DIR}" >/dev/null
 
-    cp -- /etc/hosts "${HOSTS_BACKUP}"
+    run_root_bounded 10s cp -- /etc/hosts "${HOSTS_BACKUP}"
+    HOSTS_CHANGED=true
     printf '127.0.0.1 %s api.cloudflare.com api.ipify.org api6.ipify.org\n' \
         "${FIXTURE_HOST}" |
-        "${SUDO[@]}" tee -a /etc/hosts >/dev/null
-    HOSTS_CHANGED=true
+        run_root_bounded 10s tee -a /etc/hosts >/dev/null
 
-    "${SUDO[@]}" python3 \
+    python_path="$(command -v python3)"
+    # A transient unit gives the privileged fixture its own cgroup. Capturing
+    # $! from `sudo python3 ... &` tracks sudo's supervisor on older releases,
+    # so signal forwarding and wait(1) are not reliable cleanup primitives.
+    MOCK_UNIT_ATTEMPTED=true
+    run_root_bounded 15s systemd-run \
+        --quiet \
+        --collect \
+        --unit="${MOCK_UNIT}" \
+        --property=Type=exec \
+        --property=KillMode=control-group \
+        --property=TimeoutStopSec=5s \
+        --property=RuntimeMaxSec=30min \
+        --property="StandardOutput=append:${MOCK_LOG}" \
+        --property="StandardError=append:${MOCK_LOG}" \
+        -- \
+        "${python_path}" \
         "${REPOSITORY_ROOT}/tests/bootstrap_https_mock.py" \
         --root "${WORKSPACE}/https-root" \
         --certificate "${tls}/server.crt" \
-        --private-key "${tls}/server.key" \
-        >"${MOCK_LOG}" 2>&1 &
-    MOCK_PID="$!"
+        --private-key "${tls}/server.key"
     wait_for_fixture
 }
 
@@ -750,7 +911,8 @@ run_noninteractive_uninstall() {
         fail "non-interactive uninstall deleted managed source without consent"
 }
 
-for command in cargo curl git openssl python3 rustup setfacl; do
+for command in cargo curl find git openssl python3 rustup setfacl \
+    systemctl systemd-run timeout; do
     require_command "${command}"
 done
 [[ -d /run/systemd/system ]] ||
