@@ -568,6 +568,91 @@ test_service_state_queries_fail_closed() {
         expect_failure "empty enablement for a loaded unit" \
             read_service_enablement
     ) || fail "a failed enablement query for a loaded unit was accepted"
+
+    (
+        systemctl() {
+            case "$1" in
+                show) printf 'loaded\n' ;;
+                is-enabled)
+                    printf 'not-found\n'
+                    return 1
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        expect_failure "inconsistent not-found enablement for a loaded unit" \
+            read_service_enablement
+    ) || fail "an inconsistent loaded/not-found unit state was accepted"
+
+    (
+        systemctl() {
+            case "$1" in
+                show) printf 'error\n' ;;
+                is-enabled) printf 'disabled\n' ;;
+                *) return 1 ;;
+            esac
+        }
+        expect_failure "invalid load state with familiar enablement" \
+            read_service_enablement
+    ) || fail "an invalid unit load state was accepted"
+
+    (
+        systemctl() {
+            case "$1" in
+                show) printf 'loaded\n' ;;
+                is-enabled) printf 'enabled-runtime\n' ;;
+                *) return 1 ;;
+            esac
+        }
+        [[ "$(read_service_enablement)" == enabled-runtime ]]
+    ) || fail "runtime-only enablement was not preserved as a distinct state"
+
+    (
+        systemctl() {
+            case "$1" in
+                show) printf 'loaded\n' ;;
+                is-enabled) printf 'linked\n' ;;
+                *) return 1 ;;
+            esac
+        }
+        expect_failure "linked unit enablement" read_service_enablement
+    ) || fail "an enablement state the installer cannot restore was accepted"
+}
+
+test_runtime_enablement_restoration() {
+    (
+        local enable_state=enabled
+        local persistent_enablement_removed=false
+
+        systemctl() {
+            case "$1" in
+                show)
+                    printf 'loaded\n'
+                    ;;
+                is-enabled)
+                    printf '%s\n' "${enable_state}"
+                    [[ "${enable_state}" != disabled ]]
+                    ;;
+                disable)
+                    persistent_enablement_removed=true
+                    enable_state=disabled
+                    ;;
+                enable)
+                    [[ "${2:-}" == --runtime &&
+                        "${3:-}" == "${SERVICE_NAME}" &&
+                        "${persistent_enablement_removed}" == true ]] ||
+                        return 1
+                    enable_state="enabled-runtime"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+        }
+
+        restore_service_enablement enabled-runtime
+        [[ "${enable_state}" == enabled-runtime ]]
+    ) || fail "runtime-only service enablement was not restored exactly"
 }
 
 test_quiesce_uses_account_cleanup_after_stop_failure() {
@@ -987,6 +1072,7 @@ test_configuration_directory_acl_is_rejected_before_secret_writes
 test_setid_executable_is_rejected
 test_bounded_unprivileged_command_is_executable
 test_service_state_queries_fail_closed
+test_runtime_enablement_restoration
 test_quiesce_uses_account_cleanup_after_stop_failure
 test_transaction_rollback
 test_failed_rollback_does_not_restart_mixed_state

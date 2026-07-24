@@ -79,7 +79,7 @@ ROLLBACK_DIR=""
 PRESERVE_ROLLBACK=false
 TRANSACTION_ACTIVE=false
 SERVICE_WAS_ACTIVE=false
-SERVICE_WAS_ENABLED=false
+SERVICE_ENABLEMENT_BEFORE="disabled"
 SERVICE_USER_HAD_EXISTING=false
 SERVICE_GROUP_HAD_EXISTING=false
 BUILD_ACCOUNT_VALIDATED=false
@@ -274,14 +274,14 @@ begin_transaction() {
     fi
 
     SERVICE_WAS_ACTIVE=false
-    SERVICE_WAS_ENABLED=false
+    SERVICE_ENABLEMENT_BEFORE="disabled"
     if systemd_is_running; then
         activity="$(read_service_activity)" ||
             die "could not determine the prior activity state of ${SERVICE_NAME}"
         enablement="$(read_service_enablement)" ||
             die "could not determine the prior enablement state of ${SERVICE_NAME}"
         [[ "${activity}" == active ]] && SERVICE_WAS_ACTIVE=true
-        [[ "${enablement}" == enabled ]] && SERVICE_WAS_ENABLED=true
+        SERVICE_ENABLEMENT_BEFORE="${enablement}"
     fi
     TRANSACTION_ACTIVE=true
 
@@ -481,7 +481,7 @@ rollback_transaction() {
             report_rollback_failure systemd-daemon-reload "$?"
             rollback_failed=true
         }
-        restore_service_enablement "${SERVICE_WAS_ENABLED}" || {
+        restore_service_enablement "${SERVICE_ENABLEMENT_BEFORE}" || {
             report_rollback_failure restore-service-enablement "$?"
             rollback_failed=true
         }
@@ -906,15 +906,10 @@ read_service_enablement() {
         printf '%s' disabled
         return 0
     fi
-    [[ -n "${load_state}" ]] || return 1
+    [[ "${load_state}" == loaded ]] || return 1
     enable_state="$(systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null)" || true
     case "${enable_state}" in
-        enabled | enabled-runtime | linked | linked-runtime | alias)
-            printf '%s' enabled
-            ;;
-        disabled | static | indirect | generated | transient | masked | masked-runtime | not-found)
-            printf '%s' disabled
-            ;;
+        enabled | enabled-runtime | disabled) printf '%s' "${enable_state}" ;;
         *) return 1 ;;
     esac
 }
@@ -952,26 +947,39 @@ quiesce_service() {
 }
 
 service_enablement_matches() {
-    local should_be_enabled="$1"
+    local expected_state="$1"
     local enable_state=""
 
+    case "${expected_state}" in
+        enabled | enabled-runtime | disabled) ;;
+        *) return 1 ;;
+    esac
     enable_state="$(read_service_enablement)" || return 1
-    if [[ "${should_be_enabled}" == true ]]; then
-        [[ "${enable_state}" == enabled ]]
-    else
-        [[ "${enable_state}" == disabled ]]
-    fi
+    [[ "${enable_state}" == "${expected_state}" ]]
 }
 
 restore_service_enablement() {
-    local should_be_enabled="$1"
+    local expected_state="$1"
 
-    if [[ "${should_be_enabled}" == true ]]; then
-        systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-    else
-        systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-    fi
-    service_enablement_matches "${should_be_enabled}"
+    case "${expected_state}" in
+        enabled)
+            systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+            ;;
+        enabled-runtime)
+            # Remove any persistent link created by the failed transaction,
+            # then reconstruct the original runtime-only enablement.
+            systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+            systemctl enable --runtime \
+                "${SERVICE_NAME}" >/dev/null 2>&1 || true
+            ;;
+        disabled)
+            systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    service_enablement_matches "${expected_state}"
 }
 
 quiesce_failed_service() {
@@ -2519,7 +2527,7 @@ verify_service_stopped() {
                 die "refusing to uninstall because ${SERVICE_NAME} could not be quiesced"
         fi
         systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-        service_enablement_matches false ||
+        service_enablement_matches disabled ||
             die "refusing to uninstall because ${SERVICE_NAME} remains enabled"
     fi
 
