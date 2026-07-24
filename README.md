@@ -67,28 +67,81 @@ address cache after restart.
 
 ### 1. Create a restricted API token
 
-For an unattended service, an account-owned token is the durable option:
-open **Manage Account → Account API Tokens**. A user-owned token from **My
-Profile → API Tokens** is also supported. Choose **Create Token** and use the
-**Edit zone DNS** template or a custom token. Grant only:
+For an unattended service, prefer an account-owned token because it acts as a
+service principal and is not tied to an individual user. Open **Manage Account
+→ Account API Tokens**. A user-owned token from **My Profile → API Tokens** is
+also supported. Choose **Create Token** and use the **Edit zone DNS** template
+or a custom token.
 
-- **Zone → Zone → Read**
-- **Zone → DNS → Edit**
+Configure the token policy as follows:
 
-Restrict **Zone Resources** to the zone or zones Cirrusync manages. Optional
-client-IP restrictions can improve security, but they are usually unsuitable
-for a token whose caller address changes. Copy the token when Cloudflare shows
-it; the installer stores it separately from the TOML file. For an account-owned
-token (new tokens start with `cfat_`), also copy the account's 32-character
-**Account ID**. The installer asks for it so Cirrusync can use Cloudflare's
-account-token verification endpoint. User-owned `cfut_` tokens omit the
-Account ID.
+| Dashboard setting | Required value |
+| --- | --- |
+| Zone resource | **Specified Domains**, limited to the exact zone Cirrusync manages |
+| **DNS** permission | **Edit**; the review summary may call this **DNS Write** |
+| **Zone** permission | **Read** |
+| Other permissions | Leave unchecked |
+
+Do not grant Zone Edit, account-wide administration, or unrelated permissions.
+For multiple managed zones, include only those zones.
+
+Choose the optional restrictions according to how the service will be
+operated:
+
+- **Expiration:** a finite lifetime limits exposure but stops updates when the
+  token expires. Prefer an expiry when you have a reliable reminder or
+  automated rotation process. **No expiration** avoids an unplanned DDNS outage
+  but requires deliberate periodic rotation and prompt revocation after any
+  suspected exposure.
+- **Client IP address filtering:** normally leave this as **All IP addresses
+  allowed** for a DDNS client. Restricting the token to today's dynamic WAN
+  address will lock the client out after that address changes. Use a restriction
+  only when API calls leave through a separate, stable egress CIDR; include both
+  address families if the host may reach Cloudflare over IPv4 and IPv6. An
+  `Allow 0.0.0.0/0` rule is effectively unrestricted for IPv4 and, by itself,
+  does not cover IPv6.
+
+Before creating the token, the summary should show the exact domain, **DNS
+Write**, **Zone Read**, the intended expiration, and the intended IP policy.
+Cloudflare displays the token string only when it is created, so copy it into a
+password manager or another secure secret store. Do not put it in the
+configuration file, shell history, an issue, or a log.
+
+A successful token-verification request proves that the token is active. It
+does not prove that the token includes the configured zone, Zone Read, or DNS
+Edit; the installer validates those separately.
+
+For an account-owned token (new tokens start with `cfat_`), also copy the
+account's 32-character **Account ID**. The installer asks for it so Cirrusync
+can use Cloudflare's
+[account-token verification endpoint](https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/verify/).
+User-owned `cfut_` tokens omit the Account ID. Global API Keys are not
+supported.
+
+#### Zone name, Account ID, and Zone ID
+
+The installer's **Cloudflare zone** prompt expects the DNS zone name, not an
+opaque ID. For example, when updating `home.example.com`, the zone is normally
+`example.com`. Find it in the Cloudflare dashboard's account domain list or by
+opening the domain's Overview page.
+
+For an account-owned token, copy the Account ID from the Cloudflare **Account
+home** menu using **Copy account ID**. Depending on the dashboard layout, it is
+also shown in the account Overview page's **API** section. The Account ID is an
+identifier rather than a secret, but it must be the 32-character hexadecimal ID
+of the account that owns the token.
+
+The interactive installer does not require a Zone ID. Advanced manual
+configurations may set `zone_id` to the zone's 32-character identifier; it is
+available alongside the Account ID in Cloudflare's **API** section.
 
 See Cloudflare's official [account-token
 guide](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/),
 [API token
 guide](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/),
-and [Account ID
+[token restriction
+guide](https://developers.cloudflare.com/fundamentals/api/how-to/restrict-tokens/),
+and [Account and Zone ID
 instructions](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/)
 for the current dashboard flow.
 
@@ -126,9 +179,25 @@ curl -fsSL https://raw.githubusercontent.com/wiresock/cirrusync/main/bootstrap.s
   | sudo bash
 ```
 
-The interactive installer asks for the token, zone, optional account-token
-Account ID, record, address families, interval, missing-record policy, and
-proxy status. It then:
+The interactive prompts map to these values:
+
+| Prompt | What to enter |
+| --- | --- |
+| Cloudflare zone | The zone name, such as `example.com` |
+| Cloudflare account ID | The owning Account ID for a `cfat_` token; leave blank for a `cfut_` user token |
+| DNS record name | The full hostname, such as `home.example.com` |
+| Enable IPv4 updates | `Y` when managing an A record |
+| Enable IPv6 updates | `Y` only when the host has working globally routed IPv6 and an AAAA record is wanted |
+| Update interval | `300` seconds is a conservative default |
+| Allow creation of a missing record | `Y` only when Cirrusync may create the configured A/AAAA record |
+| Enable Cloudflare proxying | Normally `N` for VPN, SSH, game, or arbitrary TCP/UDP endpoints |
+| Cloudflare API token | Paste the complete token and press Enter |
+
+Token input is intentionally hidden: nothing appears while pasting or typing,
+and the token is not printed afterward. A blank-looking token prompt is
+therefore expected.
+
+The installer then:
 
 1. verifies the operating system and architecture;
 2. installs `curl`, Git, CA certificates, build tools, `pkg-config`, `procps`,
@@ -157,6 +226,33 @@ risk-free: review the script, repository, selected branch, and ideally the
 target commit before installation. The installer accepts credential-free
 HTTPS repository URLs only and never installs a unit whose checksum differs
 from its audited built-in value.
+
+On a failed fresh installation, the newly staged configuration and token are
+removed during rollback. It is therefore normal for `/etc/cirrusync/token` not
+to exist after a validation failure; do not recreate it manually. Correct the
+input and rerun the installer. An update or reconfiguration failure instead
+restores the last-known-good installed files and service state.
+
+### Confirm a successful installation
+
+A successful installation leaves `cirrusync.service` enabled and active. The
+first cycle may immediately update Cloudflare when the discovered public
+address differs from the DNS record:
+
+```console
+sudo systemctl is-enabled cirrusync
+sudo systemctl is-active cirrusync
+sudo journalctl -u cirrusync -n 50 --no-pager
+```
+
+The journal reports either **DNS record updated** or an unchanged cycle
+summary; it never prints the token. Allow for the configured DNS TTL before
+concluding that a resolver still has the old address.
+
+The complete account-owned-token path has been exercised by the privileged CI
+installer lifecycle and confirmed in a live installation: configuration
+validation completed, the hardened systemd service started successfully, and
+an existing Cloudflare DNS record was updated to the discovered public address.
 
 ### Non-interactive installation
 
@@ -519,6 +615,11 @@ Common causes:
   Key; grant Zone Read and DNS Edit and include the exact zone resource. An
   account-owned token also requires the owning Account ID in
   `cloudflare.account_id`; a user-owned token must omit it.
+- **A valid `cfat_` token reports `401 Invalid API Token`:** account-owned
+  tokens are verified through
+  `/accounts/<ACCOUNT_ID>/tokens/verify`, not `/user/tokens/verify`. Confirm
+  that `cloudflare.account_id` is the token's owning account. Cirrusync selects
+  the correct endpoint automatically when that value is present.
 - **Plain `check` exits nonzero:** read-only validation cannot prove DNS Edit.
   Use `--allow-edit-probe` when the documented narrow PATCH and external-edit
   race are acceptable, and add
@@ -549,6 +650,9 @@ after a successful update.
 
 - Restrict the token to the minimum zones and permissions. Revoke and replace
   it immediately after suspected exposure.
+- Account and Zone IDs are identifiers, not authentication secrets. API tokens
+  are secrets: never paste one into a screenshot, chat, command line,
+  verification URL, or other record that may be retained.
 - Never put a token in the TOML file, command line, systemd unit, issue, or
   shared log. Command-line arguments are commonly visible to other users.
 - Protect configuration backups; knowing hostnames and update policy can still
