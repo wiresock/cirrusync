@@ -623,6 +623,7 @@ test_runtime_enablement_restoration() {
     (
         local enable_state=enabled
         local persistent_enablement_removed=false
+        local runtime_enablement_removed=false
 
         systemctl() {
             case "$1" in
@@ -634,13 +635,21 @@ test_runtime_enablement_restoration() {
                     [[ "${enable_state}" != disabled ]]
                     ;;
                 disable)
-                    persistent_enablement_removed=true
-                    enable_state=disabled
+                    if [[ "${2:-}" == --runtime &&
+                        "${3:-}" == "${SERVICE_NAME}" ]]; then
+                        runtime_enablement_removed=true
+                    elif [[ "${2:-}" == "${SERVICE_NAME}" ]]; then
+                        persistent_enablement_removed=true
+                        enable_state=disabled
+                    else
+                        return 1
+                    fi
                     ;;
                 enable)
                     [[ "${2:-}" == --runtime &&
                         "${3:-}" == "${SERVICE_NAME}" &&
-                        "${persistent_enablement_removed}" == true ]] ||
+                        "${persistent_enablement_removed}" == true &&
+                        "${runtime_enablement_removed}" == true ]] ||
                         return 1
                     enable_state="enabled-runtime"
                     ;;
@@ -653,6 +662,70 @@ test_runtime_enablement_restoration() {
         restore_service_enablement enabled-runtime
         [[ "${enable_state}" == enabled-runtime ]]
     ) || fail "runtime-only service enablement was not restored exactly"
+
+    (
+        local enable_state="enabled-runtime"
+        local persistent_disable_attempted=false
+        local runtime_disable_attempted=false
+
+        systemctl() {
+            case "$1" in
+                show)
+                    printf 'loaded\n'
+                    ;;
+                is-enabled)
+                    printf '%s\n' "${enable_state}"
+                    [[ "${enable_state}" != disabled ]]
+                    ;;
+                disable)
+                    if [[ "${2:-}" == --runtime &&
+                        "${3:-}" == "${SERVICE_NAME}" ]]; then
+                        runtime_disable_attempted=true
+                        enable_state=disabled
+                    elif [[ "${2:-}" == "${SERVICE_NAME}" ]]; then
+                        persistent_disable_attempted=true
+                    else
+                        return 1
+                    fi
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+        }
+
+        restore_service_enablement disabled
+        [[ "${enable_state}" == disabled &&
+            "${persistent_disable_attempted}" == true &&
+            "${runtime_disable_attempted}" == true ]]
+    ) || fail "disabled restoration did not clear runtime-only enablement"
+}
+
+test_uninstall_rejects_unsupported_enablement_before_quiescing() {
+    local mutation_marker="${BOOTSTRAP_TEST_ROOT}/unsupported-uninstall-mutation"
+
+    rm -f -- "${mutation_marker}"
+    (
+        getent() { return 1; }
+        systemd_is_running() { return 0; }
+        quiesce_service() {
+            : >"${mutation_marker}"
+            return 0
+        }
+        systemctl() {
+            case "$1" in
+                show) printf 'loaded\n' ;;
+                is-enabled) printf 'static\n' ;;
+                disable) : >"${mutation_marker}" ;;
+                *) return 1 ;;
+            esac
+        }
+
+        expect_failure "uninstall with unsupported enablement" \
+            verify_service_stopped
+    ) || fail "unsupported uninstall enablement did not fail safely"
+    [[ ! -e "${mutation_marker}" ]] ||
+        fail "uninstall mutated service state before validating enablement"
 }
 
 test_quiesce_uses_account_cleanup_after_stop_failure() {
@@ -1073,6 +1146,7 @@ test_setid_executable_is_rejected
 test_bounded_unprivileged_command_is_executable
 test_service_state_queries_fail_closed
 test_runtime_enablement_restoration
+test_uninstall_rejects_unsupported_enablement_before_quiescing
 test_quiesce_uses_account_cleanup_after_stop_failure
 test_transaction_rollback
 test_failed_rollback_does_not_restart_mixed_state

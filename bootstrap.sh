@@ -966,14 +966,18 @@ restore_service_enablement() {
             systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
             ;;
         enabled-runtime)
-            # Remove any persistent link created by the failed transaction,
-            # then reconstruct the original runtime-only enablement.
+            # Remove links in both scopes, then reconstruct the original
+            # runtime-only enablement.
             systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+            systemctl disable --runtime \
+                "${SERVICE_NAME}" >/dev/null 2>&1 || true
             systemctl enable --runtime \
                 "${SERVICE_NAME}" >/dev/null 2>&1 || true
             ;;
         disabled)
             systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+            systemctl disable --runtime \
+                "${SERVICE_NAME}" >/dev/null 2>&1 || true
             ;;
         *)
             return 1
@@ -2517,6 +2521,8 @@ verify_service_stopped() {
         SERVICE_ACCOUNT_VALIDATED=true
     fi
     if systemd_is_running; then
+        read_service_enablement >/dev/null ||
+            die "refusing to uninstall because ${SERVICE_NAME} has an unsupported enablement state"
         load_state="$(systemctl show --property=LoadState --value \
             "${SERVICE_NAME}" 2>/dev/null)" ||
             die "could not inspect ${SERVICE_NAME} before uninstall"
@@ -2526,8 +2532,7 @@ verify_service_stopped() {
             quiesce_service ||
                 die "refusing to uninstall because ${SERVICE_NAME} could not be quiesced"
         fi
-        systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-        service_enablement_matches disabled ||
+        restore_service_enablement disabled ||
             die "refusing to uninstall because ${SERVICE_NAME} remains enabled"
     fi
 
