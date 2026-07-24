@@ -48,6 +48,12 @@ TOKEN_SOURCE="/root/cirrusync-integration-token.${BASHPID}"
 TOOLCHAIN_ROOT=""
 TOOLCHAIN_CARGO_LINK_ATTEMPTED=false
 TOOLCHAIN_RUSTC_LINK_ATTEMPTED=false
+LOCAL_BIN_ORIGINAL_MODE=""
+LOCAL_BIN_NORMALIZED_MODE=""
+LOCAL_BIN_MODE_CHANGE_ATTEMPTED=false
+LOCAL_SRC_ORIGINAL_MODE=""
+LOCAL_SRC_NORMALIZED_MODE=""
+LOCAL_SRC_MODE_CHANGE_ATTEMPTED=false
 CA_INSTALLED=false
 HOSTS_CHANGED=false
 
@@ -84,12 +90,146 @@ restore_toolchain_entry() {
     "${SUDO[@]}" rm -f -- "${link_path}"
 }
 
+normalize_managed_parent_directory() {
+    local path="$1"
+    local component=""
+    local mode=""
+    local normalized_mode=""
+    local parent_mode=""
+    local uid=""
+
+    [[ "${path}" == /usr/local/bin || "${path}" == /usr/local/src ]] ||
+        {
+            fail "refusing to normalize an unexpected directory: ${path}"
+            return
+        }
+    for component in /usr /usr/local "${path}"; do
+        [[ -d "${component}" && ! -L "${component}" ]] ||
+            {
+                fail "managed parent component is not a real directory: ${component}"
+                return
+            }
+        uid="$(stat -c '%u' -- "${component}")" || return
+        [[ "${uid}" == 0 ]] ||
+            {
+                fail "managed parent component is not owned by root: ${component}"
+                return
+            }
+    done
+
+    parent_mode="$(stat -c '%a' -- "${path%/*}")" || return
+    [[ "${parent_mode}" =~ ^[0-7]{3,4}$ ]] ||
+        {
+            fail "managed parent has an invalid mode: ${path%/*}"
+            return
+        }
+    (( (8#${parent_mode} & 0022) == 0 )) ||
+        {
+            fail "managed parent is writable by group or other users: ${path%/*}"
+            return
+        }
+
+    mode="$(stat -c '%a' -- "${path}")" || return
+    [[ "${mode}" =~ ^[0-7]{3,4}$ ]] ||
+        {
+            fail "managed directory has an invalid mode: ${path}"
+            return
+        }
+    printf -v normalized_mode '%o' "$((8#${mode} & 07755))"
+    [[ "${normalized_mode}" != "${mode}" ]] || return
+
+    case "${path}" in
+        /usr/local/bin)
+            LOCAL_BIN_ORIGINAL_MODE="${mode}"
+            LOCAL_BIN_NORMALIZED_MODE="${normalized_mode}"
+            LOCAL_BIN_MODE_CHANGE_ATTEMPTED=true
+            ;;
+        /usr/local/src)
+            LOCAL_SRC_ORIGINAL_MODE="${mode}"
+            LOCAL_SRC_NORMALIZED_MODE="${normalized_mode}"
+            LOCAL_SRC_MODE_CHANGE_ATTEMPTED=true
+            ;;
+    esac
+    "${SUDO[@]}" chmod "${normalized_mode}" -- "${path}"
+
+    [[ -d "${path}" && ! -L "${path}" &&
+        "$(stat -c '%u' -- "${path}")" == 0 &&
+        "$(stat -c '%a' -- "${path}")" == "${normalized_mode}" ]] ||
+        {
+            fail "could not safely normalize managed directory: ${path}"
+            return
+        }
+}
+
+restore_managed_parent_mode() {
+    local path="$1"
+    local original_mode="$2"
+    local normalized_mode="$3"
+    local change_attempted="$4"
+    local current_mode=""
+
+    [[ "${change_attempted}" == true ]] || return
+    [[ -d "${path}" && ! -L "${path}" ]] ||
+        {
+            fail "managed directory changed type before mode restoration: ${path}"
+            return
+        }
+    [[ "$(stat -c '%u' -- "${path}")" == 0 ]] ||
+        {
+            fail "managed directory changed owner before mode restoration: ${path}"
+            return
+        }
+    current_mode="$(stat -c '%a' -- "${path}")" || return
+    if [[ "${current_mode}" == "${original_mode}" ]]; then
+        return
+    fi
+    [[ "${current_mode}" == "${normalized_mode}" ]] ||
+        {
+            fail "managed directory mode changed unexpectedly before restoration: ${path}"
+            return
+        }
+    "${SUDO[@]}" chmod "${original_mode}" -- "${path}" || return
+    [[ -d "${path}" && ! -L "${path}" &&
+        "$(stat -c '%u' -- "${path}")" == 0 &&
+        "$(stat -c '%a' -- "${path}")" == "${original_mode}" ]] ||
+        {
+            fail "could not restore the original mode on ${path}"
+            return
+        }
+}
+
+service_is_confirmed_stopped() {
+    local state=""
+    local status=""
+
+    if state="$("${SUDO[@]}" systemctl is-active cirrusync.service 2>/dev/null)"; then
+        status=0
+    else
+        status="$?"
+    fi
+    case "${state}" in
+        inactive | failed | not-found | unknown)
+            return 0
+            ;;
+        active | activating | reloading | deactivating)
+            fail "service remained in ${state} state during cleanup"
+            return
+            ;;
+        *)
+            fail "could not confirm that the service stopped (systemctl exit ${status}, state ${state:-<empty>})"
+            return
+            ;;
+    esac
+}
+
 cleanup() {
     local exit_code="$?"
+    local managed_parent_restore_failed=false
     local probe_pid=""
     local toolchain_restore_failed=false
 
     trap - EXIT
+    trap '' HUP INT TERM
     set +e
     if ((exit_code != 0)); then
         "${SUDO[@]}" systemctl --no-pager --full status cirrusync.service >&2
@@ -101,6 +241,26 @@ cleanup() {
     fi
 
     "${SUDO[@]}" systemctl disable --now cirrusync.service >/dev/null 2>&1
+    if ! service_is_confirmed_stopped; then
+        managed_parent_restore_failed=true
+    else
+        restore_managed_parent_mode \
+            /usr/local/bin \
+            "${LOCAL_BIN_ORIGINAL_MODE}" \
+            "${LOCAL_BIN_NORMALIZED_MODE}" \
+            "${LOCAL_BIN_MODE_CHANGE_ATTEMPTED}" ||
+            managed_parent_restore_failed=true
+        restore_managed_parent_mode \
+            /usr/local/src \
+            "${LOCAL_SRC_ORIGINAL_MODE}" \
+            "${LOCAL_SRC_NORMALIZED_MODE}" \
+            "${LOCAL_SRC_MODE_CHANGE_ATTEMPTED}" ||
+            managed_parent_restore_failed=true
+    fi
+    if [[ "${managed_parent_restore_failed}" == true ]]; then
+        exit_code=1
+    fi
+
     if [[ -n "${MOCK_PID}" ]]; then
         "${SUDO[@]}" kill "${MOCK_PID}" >/dev/null 2>&1
         wait "${MOCK_PID}" >/dev/null 2>&1
@@ -145,6 +305,9 @@ cleanup() {
     exit "${exit_code}"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 ||
@@ -557,6 +720,8 @@ done
 [[ -d /run/systemd/system ]] ||
     fail "bootstrap lifecycle test requires a systemd-booted disposable host"
 
+normalize_managed_parent_directory /usr/local/bin
+normalize_managed_parent_directory /usr/local/src
 chmod 0755 "${WORKSPACE}"
 prepare_repository
 install_trusted_system_toolchain

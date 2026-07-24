@@ -8,7 +8,9 @@ fn distributed_example_configuration_stays_valid() {
         r#"api_token_file = "/etc/cirrusync/token""#,
         r#"api_token_file = "C:\\ProgramData\\cirrusync\\token""#,
     );
-    let config = Config::from_toml(&source)
+    #[cfg(windows)]
+    let source = source.as_str();
+    let config = Config::from_toml(source)
         .expect("the distributed example configuration must parse and validate");
 
     assert_eq!(config.records.len(), 1);
