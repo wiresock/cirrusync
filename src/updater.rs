@@ -1257,10 +1257,15 @@ fn current_file_owner(probe_root: &Path) -> Result<u32, RuntimeLockError> {
 
 fn open_runtime_lock(
     path: &Path,
-    _expected_owner: ExpectedLockOwner,
+    expected_owner: ExpectedLockOwner,
 ) -> Result<File, RuntimeLockError> {
     #[cfg(unix)]
-    validate_existing_lock_target(path, _expected_owner.uid)?;
+    let expected_owner_uid = expected_owner.uid;
+    #[cfg(not(unix))]
+    let _ = expected_owner;
+
+    #[cfg(unix)]
+    validate_existing_lock_target(path, expected_owner_uid)?;
 
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
@@ -1317,12 +1322,11 @@ fn open_runtime_lock(
                 reason: "hard-linked lock files are not accepted".to_owned(),
             });
         }
-        let expected_owner = _expected_owner.uid;
-        if opened.uid() != expected_owner {
+        if opened.uid() != expected_owner_uid {
             return Err(RuntimeLockError::Insecure {
                 path: path.to_path_buf(),
                 reason: format!(
-                    "lock file owner {} does not match lock directory owner {expected_owner}",
+                    "lock file owner {} does not match lock directory owner {expected_owner_uid}",
                     opened.uid()
                 ),
             });

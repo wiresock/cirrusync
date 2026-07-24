@@ -24,6 +24,8 @@ readonly FSMONITOR_PID_FILE="/var/tmp/cirrusync-fsmonitor-probe.pid"
 readonly FSMONITOR_CONTAMINATION="/var/tmp/cirrusync-fsmonitor-contaminated"
 readonly STATE_DIR="/var/lib/cirrusync"
 readonly BUILD_STATE_DIR="/var/lib/cirrusync-build"
+readonly TOOLCHAIN_CARGO_LINK="/usr/sbin/cargo"
+readonly TOOLCHAIN_RUSTC_LINK="/usr/sbin/rustc"
 
 if ((EUID == 0)); then
     SUDO=()
@@ -44,8 +46,8 @@ HOSTS_BACKUP="${WORKSPACE}/hosts"
 MOCK_LOG="${WORKSPACE}/https-mock.log"
 TOKEN_SOURCE="/root/cirrusync-integration-token.${BASHPID}"
 TOOLCHAIN_ROOT=""
-TOOLCHAIN_CARGO_LINK_CREATED=false
-TOOLCHAIN_RUSTC_LINK_CREATED=false
+TOOLCHAIN_CARGO_LINK_ATTEMPTED=false
+TOOLCHAIN_RUSTC_LINK_ATTEMPTED=false
 CA_INSTALLED=false
 HOSTS_CHANGED=false
 
@@ -54,9 +56,38 @@ fail() {
     return 1
 }
 
+fail_with_log() {
+    local message="$1"
+    local log_path="$2"
+
+    if [[ -f "${log_path}" ]]; then
+        printf '%s\n' '--- captured installer output ---' >&2
+        tail -n 200 "${log_path}" >&2
+    fi
+    fail "${message}"
+}
+
+restore_toolchain_entry() {
+    local link_path="$1"
+    local expected_target="$2"
+    local link_attempted="$3"
+
+    if [[ "${link_attempted}" != true ]]; then
+        return
+    fi
+    if [[ ! -L "${link_path}" ||
+        "$(readlink -- "${link_path}" 2>/dev/null)" != \
+        "${expected_target}" ]]; then
+        fail "temporary toolchain link changed unexpectedly: ${link_path}"
+        return
+    fi
+    "${SUDO[@]}" rm -f -- "${link_path}"
+}
+
 cleanup() {
     local exit_code="$?"
     local probe_pid=""
+    local toolchain_restore_failed=false
 
     trap - EXIT
     set +e
@@ -93,17 +124,21 @@ cleanup() {
         "${FSMONITOR_MARKER}" \
         "${FSMONITOR_PID_FILE}" \
         "${FSMONITOR_CONTAMINATION}"
-    if [[ "${TOOLCHAIN_CARGO_LINK_CREATED}" == true &&
-        "$(readlink -f /usr/local/bin/cargo 2>/dev/null)" == \
-            "${TOOLCHAIN_ROOT}/bin/cargo" ]]; then
-        "${SUDO[@]}" rm -f -- /usr/local/bin/cargo
-    fi
-    if [[ "${TOOLCHAIN_RUSTC_LINK_CREATED}" == true &&
-        "$(readlink -f /usr/local/bin/rustc 2>/dev/null)" == \
-            "${TOOLCHAIN_ROOT}/bin/rustc" ]]; then
-        "${SUDO[@]}" rm -f -- /usr/local/bin/rustc
-    fi
-    if [[ "${TOOLCHAIN_ROOT}" == /opt/cirrusync-bootstrap-ci.* ]]; then
+    restore_toolchain_entry \
+        "${TOOLCHAIN_CARGO_LINK}" \
+        "${TOOLCHAIN_ROOT}/bin/cargo" \
+        "${TOOLCHAIN_CARGO_LINK_ATTEMPTED}" ||
+        toolchain_restore_failed=true
+    restore_toolchain_entry \
+        "${TOOLCHAIN_RUSTC_LINK}" \
+        "${TOOLCHAIN_ROOT}/bin/rustc" \
+        "${TOOLCHAIN_RUSTC_LINK_ATTEMPTED}" ||
+        toolchain_restore_failed=true
+    if [[ "${toolchain_restore_failed}" == true ]]; then
+        printf 'temporary toolchain preserved for recovery at %s\n' \
+            "${TOOLCHAIN_ROOT}" >&2
+        exit_code=1
+    elif [[ "${TOOLCHAIN_ROOT}" == /opt/cirrusync-bootstrap-ci.* ]]; then
         "${SUDO[@]}" rm -rf -- "${TOOLCHAIN_ROOT}"
     fi
     rm -rf -- "${WORKSPACE}"
@@ -147,14 +182,19 @@ install_trusted_system_toolchain() {
     "${SUDO[@]}" chown --recursive root:root "${TOOLCHAIN_ROOT}"
     "${SUDO[@]}" chmod --recursive a+rX,go-w "${TOOLCHAIN_ROOT}"
 
-    if [[ ! -e /usr/local/bin/cargo && ! -L /usr/local/bin/cargo ]]; then
-        "${SUDO[@]}" ln -s "${TOOLCHAIN_ROOT}/bin/cargo" /usr/local/bin/cargo
-        TOOLCHAIN_CARGO_LINK_CREATED=true
-    fi
-    if [[ ! -e /usr/local/bin/rustc && ! -L /usr/local/bin/rustc ]]; then
-        "${SUDO[@]}" ln -s "${TOOLCHAIN_ROOT}/bin/rustc" /usr/local/bin/rustc
-        TOOLCHAIN_RUSTC_LINK_CREATED=true
-    fi
+    [[ ! -e "${TOOLCHAIN_CARGO_LINK}" &&
+        ! -L "${TOOLCHAIN_CARGO_LINK}" ]] ||
+        fail "refusing to replace existing ${TOOLCHAIN_CARGO_LINK}"
+    TOOLCHAIN_CARGO_LINK_ATTEMPTED=true
+    "${SUDO[@]}" ln -s \
+        "${TOOLCHAIN_ROOT}/bin/cargo" "${TOOLCHAIN_CARGO_LINK}"
+
+    [[ ! -e "${TOOLCHAIN_RUSTC_LINK}" &&
+        ! -L "${TOOLCHAIN_RUSTC_LINK}" ]] ||
+        fail "refusing to replace existing ${TOOLCHAIN_RUSTC_LINK}"
+    TOOLCHAIN_RUSTC_LINK_ATTEMPTED=true
+    "${SUDO[@]}" ln -s \
+        "${TOOLCHAIN_ROOT}/bin/rustc" "${TOOLCHAIN_RUSTC_LINK}"
 }
 
 prepare_repository() {
@@ -263,7 +303,9 @@ run_failed_fresh_install_and_verify_rollback() {
     fi
 
     grep -Fq 'Rollback completed' "${failure_log}" ||
-        fail "failed fresh install did not report a completed rollback"
+        fail_with_log \
+            "failed fresh install did not report a completed rollback" \
+            "${failure_log}"
     for path in \
         "${BINARY_PATH}" \
         "${UNIT_PATH}" \
@@ -473,7 +515,9 @@ run_failed_reconfigure_and_verify_rollback() {
     fi
 
     grep -Fq 'Rollback completed' "${failure_log}" ||
-        fail "failed reconfiguration did not report a completed rollback"
+        fail_with_log \
+            "failed reconfiguration did not report a completed rollback" \
+            "${failure_log}"
     [[ "$("${SUDO[@]}" sha256sum "${BINARY_PATH}")" == "${binary_hash}" ]] ||
         fail "rollback changed the installed binary"
     [[ "$("${SUDO[@]}" sha256sum "${CONFIG_PATH}")" == "${config_hash}" ]] ||

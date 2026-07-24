@@ -806,7 +806,10 @@ fn load_token_file(path: &Path) -> Result<SecretString, ConfigError> {
     secret_from_text(&contents, TokenSource::File)
 }
 
-fn validate_opened_token_path(path: &Path, _opened: &Metadata) -> Result<(), ConfigError> {
+fn validate_opened_token_path(path: &Path, opened: &Metadata) -> Result<(), ConfigError> {
+    #[cfg(not(unix))]
+    let _ = opened;
+
     let named = fs::symlink_metadata(path).map_err(|source| ConfigError::TokenMetadata {
         path: path.to_path_buf(),
         source,
@@ -822,7 +825,7 @@ fn validate_opened_token_path(path: &Path, _opened: &Metadata) -> Result<(), Con
     {
         use std::os::unix::fs::MetadataExt;
 
-        if named.dev() != _opened.dev() || named.ino() != _opened.ino() {
+        if named.dev() != opened.dev() || named.ino() != opened.ino() {
             return Err(ConfigError::InsecureTokenFile {
                 path: path.to_path_buf(),
                 reason: "path changed while the token file was being opened".to_owned(),
@@ -835,9 +838,12 @@ fn validate_opened_token_path(path: &Path, _opened: &Metadata) -> Result<(), Con
 
 fn validate_token_metadata(
     path: &Path,
-    _file: &File,
+    file: &File,
     metadata: &Metadata,
 ) -> Result<(), ConfigError> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+
     if !metadata.is_file() {
         return Err(ConfigError::InsecureTokenFile {
             path: path.to_path_buf(),
@@ -890,7 +896,7 @@ fn validate_token_metadata(
     }
 
     #[cfg(target_os = "linux")]
-    reject_token_access_acl(path, _file)?;
+    reject_token_access_acl(path, file)?;
 
     Ok(())
 }
