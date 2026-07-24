@@ -467,6 +467,7 @@ test_transaction_rollback() {
     (
         getent() { return 1; }
         chown() { return 0; }
+        systemd_is_running() { return 0; }
         systemctl() {
             case "$1" in
                 is-active) printf 'inactive\n' ;;
@@ -519,6 +520,7 @@ test_failed_rollback_does_not_restart_mixed_state() {
         local service_state=active
         getent() { return 1; }
         chown() { return 0; }
+        systemd_is_running() { return 0; }
         systemctl() {
             case "$1" in
                 is-active) printf '%s\n' "${service_state}" ;;
@@ -576,6 +578,7 @@ test_ambiguous_rollback_restart_is_quiesced() {
         local service_state=active
         getent() { return 1; }
         chown() { return 0; }
+        systemd_is_running() { return 0; }
         systemctl() {
             case "$1" in
                 is-active) printf '%s\n' "${service_state}" ;;
@@ -625,6 +628,7 @@ test_failed_rollback_stop_is_reported() {
         sleep() { :; }
         getent() { return 1; }
         chown() { return 0; }
+        systemd_is_running() { return 0; }
         systemctl() {
             case "$1" in
                 is-active) printf '%s\n' "${service_state}" ;;
@@ -663,6 +667,7 @@ test_failed_pre_restore_cleanup_preserves_live_files() {
         sleep() { :; }
         getent() { return 1; }
         chown() { return 0; }
+        systemd_is_running() { return 0; }
         systemctl() {
             case "$1" in
                 is-active) printf 'inactive\n' ;;
@@ -703,6 +708,7 @@ test_failed_rollback_disable_is_reported() {
         local enabled=false
         getent() { return 1; }
         chown() { return 0; }
+        systemd_is_running() { return 0; }
         systemctl() {
             case "$1" in
                 is-active) printf 'inactive\n' ;;

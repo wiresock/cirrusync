@@ -256,8 +256,7 @@ begin_transaction() {
 
     SERVICE_WAS_ACTIVE=false
     SERVICE_WAS_ENABLED=false
-    if command -v systemctl >/dev/null 2>&1 &&
-        [[ -d /run/systemd/system ]]; then
+    if systemd_is_running; then
         activity="$(read_service_activity)" ||
             die "could not determine the prior activity state of ${SERVICE_NAME}"
         enablement="$(read_service_enablement)" ||
@@ -297,9 +296,7 @@ rollback_transaction() {
     warn "Installation did not complete; restoring the last-known-good files and service state"
     TRANSACTION_ACTIVE=false
 
-    if command -v systemctl >/dev/null 2>&1 &&
-        [[ -d /run/systemd/system ]] &&
-        ! quiesce_service; then
+    if systemd_is_running && ! quiesce_service; then
         PRESERVE_ROLLBACK=true
         warn "Rollback could not safely quiesce ${SERVICE_NAME}; live files were not modified and recovery data was preserved at ${ROLLBACK_DIR}"
         return 1
@@ -402,8 +399,7 @@ rollback_transaction() {
         fi
     fi
 
-    if command -v systemctl >/dev/null 2>&1 &&
-        [[ -d /run/systemd/system ]]; then
+    if systemd_is_running; then
         systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
         restore_service_enablement "${SERVICE_WAS_ENABLED}" ||
             rollback_failed=true
@@ -770,6 +766,11 @@ run_without_privilege_gain() {
     command -v setpriv >/dev/null 2>&1 ||
         die "setpriv is required to isolate unprivileged commands"
     runuser --user "${user_name}" -- setpriv --no-new-privs "$@"
+}
+
+systemd_is_running() {
+    command -v systemctl >/dev/null 2>&1 &&
+        [[ -d /run/systemd/system ]]
 }
 
 service_is_quiescent() {
@@ -2392,8 +2393,7 @@ verify_service_stopped() {
             "${SERVICE_USER}" "${SERVICE_GROUP}" "${STATE_DIR}"
         SERVICE_ACCOUNT_VALIDATED=true
     fi
-    if command -v systemctl >/dev/null 2>&1 &&
-        [[ -d /run/systemd/system ]]; then
+    if systemd_is_running; then
         load_state="$(systemctl show --property=LoadState --value \
             "${SERVICE_NAME}" 2>/dev/null)" ||
             die "could not inspect ${SERVICE_NAME} before uninstall"
@@ -2459,8 +2459,7 @@ uninstall() {
 
     rm -f -- "${UNIT_PATH}" "${UNIT_OVERRIDE_PATH}" "${BINARY_PATH}"
     rmdir --ignore-fail-on-non-empty "${UNIT_OVERRIDE_DIR}" 2>/dev/null || true
-    if command -v systemctl >/dev/null 2>&1 &&
-        [[ -d /run/systemd/system ]]; then
+    if systemd_is_running; then
         systemctl daemon-reload
         systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
     fi

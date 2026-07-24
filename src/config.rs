@@ -900,7 +900,8 @@ fn reject_token_access_acl(path: &Path, file: &File) -> Result<(), ConfigError> 
     use rustix::fs::fgetxattr;
     use rustix::io::Errno;
 
-    match fgetxattr(file, "system.posix_acl_access", Vec::<u8>::with_capacity(1)) {
+    let mut value = Vec::<u8>::with_capacity(1);
+    match fgetxattr(file, "system.posix_acl_access", &mut value) {
         Err(Errno::NODATA | Errno::NOTSUP) => Ok(()),
         Ok(_) | Err(Errno::RANGE) => Err(ConfigError::InsecureTokenFile {
             path: path.to_path_buf(),
