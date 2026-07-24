@@ -59,6 +59,8 @@ request_timeout_seconds = 15
 
 [cloudflare]
 api_token_file = "/etc/cirrusync/token"
+# Required for a cfat_ account-owned token; omit for a user-owned token.
+# account_id = "0123456789abcdef0123456789abcdef"
 
 [ipv4]
 enabled = true
@@ -218,6 +220,20 @@ impl Config {
                 "must be an absolute path",
             ));
         }
+        if let Some(account_id) = &self.cloudflare.account_id {
+            if account_id != &account_id.trim().to_ascii_lowercase() {
+                return Err(validation(
+                    "cloudflare.account_id",
+                    "must already be lowercase and trimmed",
+                ));
+            }
+            if account_id.len() != 32 || !account_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(validation(
+                    "cloudflare.account_id",
+                    "must be exactly 32 hexadecimal characters",
+                ));
+            }
+        }
         if self.records.is_empty() {
             return Err(validation("records", "at least one record is required"));
         }
@@ -291,6 +307,12 @@ impl Config {
     }
 
     fn canonicalize(&mut self) {
+        self.cloudflare.account_id = self
+            .cloudflare
+            .account_id
+            .take()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
         for record in &mut self.records {
             record.zone = canonical_dns_name(&record.zone);
             record.name = canonical_dns_name(&record.name);
@@ -316,12 +338,19 @@ impl Config {
 #[serde(default, deny_unknown_fields)]
 pub struct CloudflareConfig {
     pub api_token_file: PathBuf,
+    /// Owning account for an account-owned API token.
+    ///
+    /// User API tokens omit this value. Legacy unprefixed account tokens use
+    /// its presence to select Cloudflare's account-token verification API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl Default for CloudflareConfig {
     fn default() -> Self {
         Self {
             api_token_file: PathBuf::from(DEFAULT_TOKEN_PATH),
+            account_id: None,
         }
     }
 }
@@ -1278,6 +1307,51 @@ mod tests {
             assert!(matches!(
                 error,
                 ConfigError::Validation { ref field, .. } if field == "records[0].zone_id"
+            ));
+        }
+    }
+
+    #[test]
+    fn validates_and_canonicalizes_cloudflare_account_ids() {
+        let config = Config::from_toml(
+            r#"
+                [cloudflare]
+                account_id = " ABCDEF0123456789ABCDEF0123456789 "
+
+                [[records]]
+                zone = "example.com"
+                name = "home.example.com"
+                type = "A"
+            "#,
+        )
+        .expect("32 hexadecimal characters should form a valid account ID");
+        assert_eq!(
+            config.cloudflare.account_id.as_deref(),
+            Some("abcdef0123456789abcdef0123456789")
+        );
+
+        for account_id in [
+            "account-id",
+            "../0123456789abcdef0123456789abc",
+            "g123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            let input = format!(
+                r#"
+                    [cloudflare]
+                    account_id = "{account_id}"
+
+                    [[records]]
+                    zone = "example.com"
+                    name = "home.example.com"
+                    type = "A"
+                "#
+            );
+            let error = parse_error(&input);
+            assert!(matches!(
+                error,
+                ConfigError::Validation { ref field, .. } if field == "cloudflare.account_id"
             ));
         }
     }

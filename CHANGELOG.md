@@ -14,6 +14,8 @@ All notable changes to Cirrusync are documented here. The format follows
 - Multi-zone and multi-record synchronization through Cloudflare API v4.
 - Defensive Debian/Ubuntu bootstrap installer and hardened systemd service.
 - Unit, integration, installer, and CI checks.
+- User-owned and account-owned Cloudflare API tokens, including explicit
+  account-scoped verification.
 
 ### Security
 
@@ -38,5 +40,7 @@ All notable changes to Cirrusync are documented here. The format follows
   claims DNS Edit was verified.
 - Non-interactive configuration replacement now uses the explicit
   `--reconfigure` action.
+- Authentication aborts report their root cause without derivative DNS-edit
+  permission failures.
 
 [Unreleased]: https://github.com/wiresock/cirrusync/commits/main

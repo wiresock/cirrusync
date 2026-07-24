@@ -92,6 +92,28 @@ pub enum CloudflareError {
     #[error("Cloudflare API token contains invalid characters")]
     InvalidToken,
 
+    /// Account-owned API tokens need their owning account for verification.
+    #[error(
+        "Cloudflare account API tokens require cloudflare.account_id (the 32-character Account ID)"
+    )]
+    AccountIdRequired,
+
+    /// A configured account ID did not have Cloudflare's documented shape.
+    #[error("Cloudflare account ID must be exactly 32 hexadecimal characters")]
+    InvalidAccountId,
+
+    /// A user-owned token cannot be verified through an account endpoint.
+    #[error("cloudflare.account_id must be omitted when using a cfut_ user API token")]
+    UserTokenAccountMismatch,
+
+    /// Global API keys grant much more authority and use a different scheme.
+    #[error("Cloudflare Global API Keys are unsupported; use a restricted API token")]
+    GlobalApiKeyUnsupported,
+
+    /// A prefixed Cloudflare credential was not a supported API-token type.
+    #[error("unsupported Cloudflare credential type; use a cfut_ or cfat_ API token")]
+    UnsupportedCredentialType,
+
     /// A zero request timeout would make every operation fail immediately.
     #[error("Cloudflare request timeout must be nonzero")]
     InvalidTimeout,
@@ -286,6 +308,12 @@ impl CloudflareError {
         )
     }
 
+    /// Whether Cloudflare accepted the credential but denied this operation.
+    #[must_use]
+    pub const fn is_permission_denied(&self) -> bool {
+        matches!(self, Self::PermissionDenied { .. })
+    }
+
     /// Whether this failure is a global rate-limit response.
     #[must_use]
     pub const fn is_rate_limited(&self) -> bool {
@@ -323,6 +351,93 @@ impl CloudflareError {
     }
 }
 
+#[derive(Clone)]
+enum VerificationTarget {
+    User,
+    Account { account_id: String },
+}
+
+fn select_verification_target(
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<VerificationTarget, CloudflareError> {
+    let account_id = account_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                Ok(value.to_ascii_lowercase())
+            } else {
+                Err(CloudflareError::InvalidAccountId)
+            }
+        })
+        .transpose()?;
+
+    if token.starts_with("cfat_") {
+        return account_id
+            .map(|account_id| VerificationTarget::Account { account_id })
+            .ok_or(CloudflareError::AccountIdRequired);
+    }
+    if token.starts_with("cfut_") {
+        return if account_id.is_some() {
+            Err(CloudflareError::UserTokenAccountMismatch)
+        } else {
+            Ok(VerificationTarget::User)
+        };
+    }
+    if token.starts_with("cfk_") {
+        return Err(CloudflareError::GlobalApiKeyUnsupported);
+    }
+    if has_scannable_credential_prefix(token) {
+        return Err(CloudflareError::UnsupportedCredentialType);
+    }
+
+    Ok(account_id.map_or(VerificationTarget::User, |account_id| {
+        VerificationTarget::Account { account_id }
+    }))
+}
+
+fn has_scannable_credential_prefix(token: &str) -> bool {
+    let Some((prefix, _)) = token.split_once('_') else {
+        return false;
+    };
+    (3..=12).contains(&prefix.len())
+        && prefix.starts_with("cf")
+        && prefix.bytes().all(|byte| byte.is_ascii_lowercase())
+}
+
+fn contextualize_account_verification_error(error: CloudflareError) -> CloudflareError {
+    const ACCOUNT_ID_HINT: &str = "verify that cloudflare.account_id is the token's owning account";
+
+    match error {
+        CloudflareError::Authentication {
+            status,
+            message,
+            errors,
+        } => CloudflareError::Authentication {
+            status,
+            message: sanitize_and_truncate(
+                &format!("{message}; {ACCOUNT_ID_HINT}"),
+                MAX_ERROR_SUMMARY_BYTES,
+            ),
+            errors,
+        },
+        CloudflareError::PermissionDenied {
+            status,
+            message,
+            errors,
+        } => CloudflareError::PermissionDenied {
+            status,
+            message: sanitize_and_truncate(
+                &format!("{message}; {ACCOUNT_ID_HINT}"),
+                MAX_ERROR_SUMMARY_BYTES,
+            ),
+            errors,
+        },
+        other => other,
+    }
+}
+
 /// A cloneable Cloudflare DNS client.
 ///
 /// Clones share both the HTTP connection pool and zone-ID cache.
@@ -331,6 +446,7 @@ pub struct CloudflareClient {
     http: reqwest::Client,
     api_base: Url,
     api_token: Arc<SecretString>,
+    verification_target: VerificationTarget,
     request_timeout: Duration,
     zone_cache: Arc<RwLock<HashMap<String, String>>>,
 }
@@ -352,13 +468,30 @@ impl CloudflareClient {
     /// # Errors
     ///
     /// Returns an error if the token cannot be encoded safely or the HTTP
-    /// client cannot be constructed.
+    /// client cannot be constructed. Account-owned tokens must use
+    /// [`Self::new_with_account_id`].
     pub fn new(api_token: &SecretString, timeout: Duration) -> Result<Self, CloudflareError> {
-        Self::with_api_base(api_token, timeout, API_BASE, true)
+        Self::with_api_base(api_token, None, timeout, API_BASE, true)
+    }
+
+    /// Construct a client for an account-owned API token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token/account pairing is inconsistent, the
+    /// token cannot be encoded safely, or the HTTP client cannot be
+    /// constructed.
+    pub fn new_with_account_id(
+        api_token: &SecretString,
+        account_id: &str,
+        timeout: Duration,
+    ) -> Result<Self, CloudflareError> {
+        Self::with_api_base(api_token, Some(account_id), timeout, API_BASE, true)
     }
 
     fn with_api_base(
         api_token: &SecretString,
+        account_id: Option<&str>,
         timeout: Duration,
         api_base: &str,
         enforce_https: bool,
@@ -366,6 +499,8 @@ impl CloudflareClient {
         if timeout.is_zero() {
             return Err(CloudflareError::InvalidTimeout);
         }
+        let verification_target =
+            select_verification_target(api_token.expose_secret(), account_id)?;
         let mut authorization =
             HeaderValue::from_str(&format!("Bearer {}", api_token.expose_secret()))
                 .map_err(|_| CloudflareError::InvalidToken)?;
@@ -397,6 +532,7 @@ impl CloudflareClient {
             http,
             api_base,
             api_token: Arc::new(SecretString::new(api_token.expose_secret().to_owned())),
+            verification_target,
             request_timeout: timeout,
             zone_cache: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -415,7 +551,18 @@ impl CloudflareClient {
         timeout: Duration,
         api_base: &str,
     ) -> Result<Self, CloudflareError> {
-        Self::with_api_base(api_token, timeout, api_base, false)
+        Self::with_api_base(api_token, None, timeout, api_base, false)
+    }
+
+    /// Construct an account-token client pointed at a mock server.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_account_id(
+        api_token: &SecretString,
+        account_id: &str,
+        timeout: Duration,
+        api_base: &str,
+    ) -> Result<Self, CloudflareError> {
+        Self::with_api_base(api_token, Some(account_id), timeout, api_base, false)
     }
 
     /// Verify that the configured API token is active.
@@ -424,10 +571,26 @@ impl CloudflareClient {
     ///
     /// Returns a typed transport, authentication, API, or response-format error.
     pub async fn verify_token(&self) -> Result<(), CloudflareError> {
-        let url = self.endpoint(&["user", "tokens", "verify"]);
+        let account_verification = matches!(
+            &self.verification_target,
+            VerificationTarget::Account { .. }
+        );
+        let url = match &self.verification_target {
+            VerificationTarget::User => self.endpoint(&["user", "tokens", "verify"]),
+            VerificationTarget::Account { account_id } => {
+                self.endpoint(&["accounts", account_id, "tokens", "verify"])
+            }
+        };
         let response: ApiResponse<TokenVerification> = self
             .send(self.http.get(url), "verifying the API token")
-            .await?;
+            .await
+            .map_err(|error| {
+                if account_verification {
+                    contextualize_account_verification_error(error)
+                } else {
+                    error
+                }
+            })?;
 
         if response.result.status.eq_ignore_ascii_case("active") {
             Ok(())
@@ -1087,8 +1250,14 @@ mod tests {
         MAX_RESPONSE_BYTES, RecordPayload, error_summary, parse_retry_after,
     };
 
+    const ACCOUNT_ID: &str = "0123456789abcdef0123456789abcdef";
+
     fn token() -> SecretString {
         SecretString::new("test-token".to_owned())
+    }
+
+    fn account_token() -> SecretString {
+        SecretString::new("cfat_test-account-token".to_owned())
     }
 
     fn envelope(result: serde_json::Value) -> serde_json::Value {
@@ -1145,6 +1314,126 @@ mod tests {
             .verify_token()
             .await
             .expect("active token should verify");
+    }
+
+    #[tokio::test]
+    async fn verifies_account_owned_token_through_its_account_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/client/v4/accounts/{ACCOUNT_ID}/tokens/verify"
+            )))
+            .and(header("authorization", "Bearer cfat_test-account-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
+                "id": "token-id",
+                "status": "active"
+            }))))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        CloudflareClient::new_for_test_with_account_id(
+            &account_token(),
+            &ACCOUNT_ID.to_ascii_uppercase(),
+            Duration::from_secs(2),
+            &format!("{}/client/v4/", server.uri()),
+        )
+        .expect("account-token client should be valid")
+        .verify_token()
+        .await
+        .expect("active account token should verify");
+    }
+
+    #[test]
+    fn rejects_account_token_without_an_account_id() {
+        let error = CloudflareClient::new_for_test(
+            &account_token(),
+            Duration::from_secs(2),
+            "http://127.0.0.1/client/v4/",
+        )
+        .expect_err("an account token without its account ID must be rejected");
+
+        assert!(matches!(error, CloudflareError::AccountIdRequired));
+    }
+
+    #[test]
+    fn rejects_user_token_with_an_account_id() {
+        let error = CloudflareClient::new_for_test_with_account_id(
+            &SecretString::new("cfut_test-user-token".to_owned()),
+            ACCOUNT_ID,
+            Duration::from_secs(2),
+            "http://127.0.0.1/client/v4/",
+        )
+        .expect_err("a user token must not be bound to an account endpoint");
+
+        assert!(matches!(error, CloudflareError::UserTokenAccountMismatch));
+    }
+
+    #[test]
+    fn rejects_malformed_account_id_before_building_a_client() {
+        let error = CloudflareClient::new_for_test_with_account_id(
+            &account_token(),
+            "not-an-account-id",
+            Duration::from_secs(2),
+            "http://127.0.0.1/client/v4/",
+        )
+        .expect_err("malformed account IDs must be rejected locally");
+
+        assert!(matches!(error, CloudflareError::InvalidAccountId));
+    }
+
+    #[test]
+    fn rejects_global_keys_and_unknown_prefixed_credentials() {
+        for (value, expected) in [
+            (
+                "cfk_test-global-key",
+                CloudflareError::GlobalApiKeyUnsupported,
+            ),
+            (
+                "cfoo_test-unknown-credential",
+                CloudflareError::UnsupportedCredentialType,
+            ),
+        ] {
+            let error = CloudflareClient::new_for_test(
+                &SecretString::new(value.to_owned()),
+                Duration::from_secs(2),
+                "http://127.0.0.1/client/v4/",
+            )
+            .expect_err("unsupported credentials must be rejected locally");
+
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_id_selects_account_verification_for_legacy_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/client/v4/accounts/{ACCOUNT_ID}/tokens/verify"
+            )))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
+                "id": "token-id",
+                "status": "active"
+            }))))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        CloudflareClient::new_for_test_with_account_id(
+            &token(),
+            ACCOUNT_ID,
+            Duration::from_secs(2),
+            &format!("{}/client/v4/", server.uri()),
+        )
+        .expect("legacy account-token client should be valid")
+        .verify_token()
+        .await
+        .expect("legacy account token should verify");
     }
 
     #[tokio::test]

@@ -7,6 +7,8 @@ request_timeout_seconds = 15
 # Keep the token out of this file. The service account must be able to read the
 # token file; the installer uses root:cirrusync ownership and mode 0640.
 api_token_file = "/etc/cirrusync/token"
+# Required for a cfat_ account-owned token; omit for a user-owned token.
+# account_id = "0123456789abcdef0123456789abcdef"
 
 [ipv4]
 enabled = true

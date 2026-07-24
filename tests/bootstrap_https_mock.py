@@ -17,7 +17,8 @@ ZONE_ID = "0123456789abcdef0123456789abcdef"
 RECORD_NAME = "host.example.test"
 RECORD_ID = "record-id"
 PUBLIC_IPV4 = "8.8.8.8"
-API_TOKEN = "cirrusync-integration-token"
+API_TOKEN = "cfat_cirrusync-integration-token"
+ACCOUNT_ID = "abcdef0123456789abcdef0123456789"
 
 
 def api_envelope(result: object) -> dict[str, object]:
@@ -120,7 +121,7 @@ class FixtureHandler(SimpleHTTPRequestHandler):
             return
         if not self._authorized():
             return
-        if path == "/client/v4/user/tokens/verify":
+        if path == f"/client/v4/accounts/{ACCOUNT_ID}/tokens/verify":
             self._send_json(
                 HTTPStatus.OK,
                 api_envelope({"id": "token-id", "status": "active"}),

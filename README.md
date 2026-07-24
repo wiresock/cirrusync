@@ -67,8 +67,10 @@ address cache after restart.
 
 ### 1. Create a restricted API token
 
-In the Cloudflare dashboard, open **My Profile → API Tokens**, choose **Create
-Token**, and use the **Edit zone DNS** template or a custom token. Grant only:
+For an unattended service, an account-owned token is the durable option:
+open **Manage Account → Account API Tokens**. A user-owned token from **My
+Profile → API Tokens** is also supported. Choose **Create Token** and use the
+**Edit zone DNS** template or a custom token. Grant only:
 
 - **Zone → Zone → Read**
 - **Zone → DNS → Edit**
@@ -76,10 +78,18 @@ Token**, and use the **Edit zone DNS** template or a custom token. Grant only:
 Restrict **Zone Resources** to the zone or zones Cirrusync manages. Optional
 client-IP restrictions can improve security, but they are usually unsuitable
 for a token whose caller address changes. Copy the token when Cloudflare shows
-it; the installer stores it separately from the TOML file.
+it; the installer stores it separately from the TOML file. For an account-owned
+token (new tokens start with `cfat_`), also copy the account's 32-character
+**Account ID**. The installer asks for it so Cirrusync can use Cloudflare's
+account-token verification endpoint. User-owned `cfut_` tokens omit the
+Account ID.
 
-See Cloudflare's official
-[API token guide](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+See Cloudflare's official [account-token
+guide](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/),
+[API token
+guide](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/),
+and [Account ID
+instructions](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/)
 for the current dashboard flow.
 
 ### 2. Create the initial DNS record
@@ -116,8 +126,9 @@ curl -fsSL https://raw.githubusercontent.com/wiresock/cirrusync/main/bootstrap.s
   | sudo bash
 ```
 
-The interactive installer asks for the token, zone, record, address families,
-interval, missing-record policy, and proxy status. It then:
+The interactive installer asks for the token, zone, optional account-token
+Account ID, record, address families, interval, missing-record policy, and
+proxy status. It then:
 
 1. verifies the operating system and architecture;
 2. installs `curl`, Git, CA certificates, build tools, `pkg-config`, `procps`,
@@ -149,12 +160,15 @@ from its audited built-in value.
 
 ### Non-interactive installation
 
-Prefer a root-readable token source file over an environment variable:
+Prefer a root-readable token source file over an environment variable. This
+example uses an account-owned token; omit `CIRRUSYNC_ACCOUNT_ID` for a
+user-owned token:
 
 ```console
 sudo install -o root -g root -m 0600 /path/to/downloaded-token \
   /root/cirrusync-token
 sudo CIRRUSYNC_ZONE=example.com \
+  CIRRUSYNC_ACCOUNT_ID=0123456789abcdef0123456789abcdef \
   CIRRUSYNC_RECORD=home.example.com \
   CIRRUSYNC_ENABLE_IPV4=true \
   CIRRUSYNC_ENABLE_IPV6=false \
@@ -164,12 +178,14 @@ sudo CIRRUSYNC_ZONE=example.com \
     --non-interactive
 ```
 
-Optional variables are `CIRRUSYNC_CREATE` and `CIRRUSYNC_PROXIED`, both
-defaulting to `false`. `CFDDNS_*` aliases are accepted to ease migration from
-generic installer examples. `CIRRUSYNC_TOKEN`/`CFDDNS_TOKEN` are supported,
-but environment secrets may be inherited by child processes, retained in
-automation configuration, or visible to sufficiently privileged process
-inspection. They are not printed by the installer.
+`CIRRUSYNC_ACCOUNT_ID` is required for account-owned tokens and must be omitted
+for user-owned tokens. Optional variables are `CIRRUSYNC_CREATE` and
+`CIRRUSYNC_PROXIED`, both defaulting to `false`. `CFDDNS_*` aliases are accepted
+to ease migration from generic installer examples.
+`CIRRUSYNC_TOKEN`/`CFDDNS_TOKEN` are supported, but environment secrets may be
+inherited by child processes, retained in automation configuration, or visible
+to sufficiently privileged process inspection. They are not printed by the
+installer.
 
 An ordinary non-interactive rerun selects update mode and preserves the
 existing configuration and token. To replace configuration from automation,
@@ -214,6 +230,8 @@ request_timeout_seconds = 15
 
 [cloudflare]
 api_token_file = "/etc/cirrusync/token"
+# Required for a cfat_ account-owned token; omit for a user-owned token.
+# account_id = "0123456789abcdef0123456789abcdef"
 
 [ipv4]
 enabled = true
@@ -242,6 +260,12 @@ and duplicate type/name definitions are rejected. `zone_id` is optional;
 when supplied, Cirrusync verifies that it identifies the configured active
 zone. Without it, Cirrusync requires one unambiguous active exact-name match
 and caches the ID for the process lifetime.
+
+`cloudflare.account_id` selects Cloudflare's account-token verification
+endpoint. It is required for `cfat_` account-owned tokens and for legacy
+unprefixed account tokens, and must be omitted for `cfut_` user-owned tokens.
+It is an identifier rather than a secret, but it must contain exactly 32
+hexadecimal characters.
 
 `cloudflare.api_token_file` must be absolute. On Unix, Cirrusync accepts a
 root-owned regular file with owner-read permission and no permissions beyond
@@ -492,7 +516,9 @@ sudo journalctl -u cirrusync --since "30 minutes ago" --no-pager
 Common causes:
 
 - **Authentication or permission failure:** create a token, not a Global API
-  Key; grant Zone Read and DNS Edit and include the exact zone resource.
+  Key; grant Zone Read and DNS Edit and include the exact zone resource. An
+  account-owned token also requires the owning Account ID in
+  `cloudflare.account_id`; a user-owned token must omit it.
 - **Plain `check` exits nonzero:** read-only validation cannot prove DNS Edit.
   Use `--allow-edit-probe` when the documented narrow PATCH and external-edit
   race are acceptable, and add

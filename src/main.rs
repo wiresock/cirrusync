@@ -126,7 +126,12 @@ fn build_updater(config_path: &Path) -> Result<Updater, AppError> {
     );
 
     let token = config.load_api_token()?;
-    let cloudflare = CloudflareClient::new(&token, config.request_timeout())?;
+    let cloudflare = match config.cloudflare.account_id.as_deref() {
+        Some(account_id) => {
+            CloudflareClient::new_with_account_id(&token, account_id, config.request_timeout())?
+        }
+        None => CloudflareClient::new(&token, config.request_timeout())?,
+    };
     let public_ip = PublicIpClient::new(config.request_timeout())?;
     Updater::new(config, cloudflare, public_ip).map_err(AppError::from)
 }

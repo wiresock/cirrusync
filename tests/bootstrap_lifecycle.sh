@@ -12,7 +12,9 @@ readonly REPOSITORY_ROOT
 readonly FIXTURE_HOST="cirrusync-ci.invalid"
 readonly REPOSITORY_URL="https://${FIXTURE_HOST}/repo.git"
 readonly INTEGRATION_BRANCH="bootstrap-integration"
-readonly TOKEN_VALUE="cirrusync-integration-token"
+readonly TOKEN_VALUE="cfat_cirrusync-integration-token"
+readonly ACCOUNT_ID="ABCDEF0123456789ABCDEF0123456789"
+readonly CANONICAL_ACCOUNT_ID="abcdef0123456789abcdef0123456789"
 readonly CONFIG_DIR="/etc/cirrusync"
 readonly CONFIG_PATH="/etc/cirrusync/config.toml"
 readonly TOKEN_PATH="/etc/cirrusync/token"
@@ -616,6 +618,7 @@ run_failed_fresh_install_and_verify_rollback() {
     if "${SUDO[@]}" env \
         CIRRUSYNC_TOKEN_FILE="${TOKEN_SOURCE}" \
         CIRRUSYNC_ZONE="failure.test" \
+        CIRRUSYNC_ACCOUNT_ID="${ACCOUNT_ID}" \
         CIRRUSYNC_RECORD="host.failure.test" \
         CIRRUSYNC_ENABLE_IPV4=true \
         CIRRUSYNC_ENABLE_IPV6=false \
@@ -656,6 +659,7 @@ run_install() {
     "${SUDO[@]}" env \
         CIRRUSYNC_TOKEN_FILE="${TOKEN_SOURCE}" \
         CIRRUSYNC_ZONE="example.test" \
+        CIRRUSYNC_ACCOUNT_ID="${ACCOUNT_ID}" \
         CIRRUSYNC_RECORD="host.example.test" \
         CIRRUSYNC_ENABLE_IPV4=true \
         CIRRUSYNC_ENABLE_IPV6=false \
@@ -676,6 +680,10 @@ run_install() {
         fail "fresh install did not install the binary"
     "${SUDO[@]}" test -f "${CONFIG_PATH}" ||
         fail "fresh install did not write the configuration"
+    "${SUDO[@]}" grep -Fqx \
+        "account_id = \"${CANONICAL_ACCOUNT_ID}\"" \
+        "${CONFIG_PATH}" ||
+        fail "fresh install did not write the canonical Cloudflare account ID"
     "${SUDO[@]}" test -f "${TOKEN_PATH}" ||
         fail "fresh install did not write the token"
     "${SUDO[@]}" test ! -e "${BUILD_STATE_DIR}/cargo/bin/rustup" ||
@@ -773,6 +781,7 @@ run_prebuild_boundary_checks() {
     if "${SUDO[@]}" env \
         CIRRUSYNC_TOKEN_FILE="${TOKEN_SOURCE}" \
         CIRRUSYNC_ZONE="example.test" \
+        CIRRUSYNC_ACCOUNT_ID="${ACCOUNT_ID}" \
         CIRRUSYNC_RECORD="host.example.test" \
         CIRRUSYNC_ENABLE_IPV4=true \
         CIRRUSYNC_ENABLE_IPV6=false \
@@ -867,6 +876,7 @@ run_failed_reconfigure_and_verify_rollback() {
 
     if "${SUDO[@]}" env \
         CIRRUSYNC_ZONE="failure.test" \
+        CIRRUSYNC_ACCOUNT_ID="${ACCOUNT_ID}" \
         CIRRUSYNC_RECORD="host.failure.test" \
         bash "${REPOSITORY_ROOT}/bootstrap.sh" \
         --non-interactive \

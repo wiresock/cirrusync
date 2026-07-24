@@ -182,7 +182,7 @@ impl fmt::Display for CycleReport {
 pub struct CheckReport {
     /// Number of configured records considered.
     pub records: usize,
-    /// Whether `/user/tokens/verify` accepted the token as active.
+    /// Whether the appropriate user- or account-token endpoint accepted it.
     pub authenticated: bool,
     /// Existing records visible to the API token.
     pub existing: usize,
@@ -449,19 +449,21 @@ impl Updater {
         match timeout_at(deadline, self.cloudflare.verify_token()).await {
             Err(_) => {
                 report.failures.push(check_deadline_failure());
-                finalize_check_report(&mut report, &proofs, allow_edit_probe);
+                summarize_check_proofs(&mut report, &proofs);
                 return report;
             }
             Ok(Ok(())) => report.authenticated = true,
             Ok(Err(error)) => {
-                let abort_api_work = error.is_authentication_failure() || error.is_rate_limited();
+                let abort_api_work = error.is_authentication_failure()
+                    || error.is_permission_denied()
+                    || error.is_rate_limited();
                 report.failures.push(cloudflare_failure(
                     "Cloudflare API token".to_owned(),
                     FailureStage::Authentication,
                     &error,
                 ));
                 if abort_api_work {
-                    finalize_check_report(&mut report, &proofs, allow_edit_probe);
+                    summarize_check_proofs(&mut report, &proofs);
                     return report;
                 }
             }
@@ -469,7 +471,7 @@ impl Updater {
 
         let Ok(addresses) = timeout_at(deadline, self.discover_required_addresses()).await else {
             report.failures.push(check_deadline_failure());
-            finalize_check_report(&mut report, &proofs, allow_edit_probe);
+            summarize_check_proofs(&mut report, &proofs);
             return report;
         };
         addresses.append_discovery_failures(&mut report.failures);
@@ -1718,8 +1720,7 @@ fn finalize_check_report(
     proofs: &ZoneProofs,
     edit_probe_requested: bool,
 ) {
-    report.edit_verified_zones = proofs.verified_count();
-    report.edit_permission_verified = proofs.is_complete();
+    summarize_check_proofs(report, proofs);
     for target in proofs.unverified_targets() {
         let message = if edit_probe_requested {
             "DNS edit permission could not be proved for this zone".to_owned()
@@ -1734,6 +1735,11 @@ fn finalize_check_report(
     }
 }
 
+fn summarize_check_proofs(report: &mut CheckReport, proofs: &ZoneProofs) {
+    report.edit_verified_zones = proofs.verified_count();
+    report.edit_permission_verified = proofs.is_complete();
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1745,7 +1751,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
     use tokio::time::{Instant, sleep};
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{CHECK_TIMEOUT, CycleControl, FailureKind, RuntimeLockError, Updater};
@@ -1755,6 +1761,8 @@ mod tests {
         RecordConfig, RecordType,
     };
     use crate::public_ip::PublicIpClient;
+
+    const ACCOUNT_ID: &str = "0123456789abcdef0123456789abcdef";
 
     fn envelope(result: serde_json::Value) -> serde_json::Value {
         let mut value = json!({
@@ -1786,6 +1794,7 @@ mod tests {
             request_timeout_seconds: 2,
             cloudflare: CloudflareConfig {
                 api_token_file: std::env::temp_dir().join("cirrusync-unused-token"),
+                account_id: None,
             },
             ipv4: IpDiscoveryConfig {
                 enabled: true,
@@ -2215,6 +2224,192 @@ mod tests {
         assert!(report.edit_permission_verified);
         assert_eq!(report.edit_verified_zones, 1);
         assert_eq!(report.existing, 1);
+    }
+
+    #[tokio::test]
+    async fn account_owned_token_completes_the_full_permission_check() {
+        let cloudflare = MockServer::start().await;
+        let ip = MockServer::start().await;
+        mock_public_ip(&ip).await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/client/v4/accounts/{ACCOUNT_ID}/tokens/verify"
+            )))
+            .and(header("authorization", "Bearer cfat_test-account-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
+                "id": "token-id",
+                "status": "active"
+            }))))
+            .expect(1)
+            .mount(&cloudflare)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/0123456789abcdef0123456789abcdef"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
+                "id": "0123456789abcdef0123456789abcdef",
+                "name": "example.com",
+                "status": "active"
+            }))))
+            .expect(1)
+            .mount(&cloudflare)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/zones/0123456789abcdef0123456789abcdef/dns_records",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(envelope(json!([dns_record(
+                    "record-id",
+                    "home.example.com",
+                    "1.1.1.1"
+                )]))),
+            )
+            .expect(1)
+            .mount(&cloudflare)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/client/v4/zones/0123456789abcdef0123456789abcdef/dns_records/record-id",
+            ))
+            .and(wiremock::matchers::body_json(json!({
+                "type": "A",
+                "name": "home.example.com",
+                "ttl": 120
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(envelope(dns_record(
+                    "record-id",
+                    "home.example.com",
+                    "1.1.1.1",
+                ))),
+            )
+            .expect(1)
+            .mount(&cloudflare)
+            .await;
+
+        let token = SecretString::new("cfat_test-account-token".to_owned());
+        let client = CloudflareClient::new_for_test_with_account_id(
+            &token,
+            ACCOUNT_ID,
+            Duration::from_secs(2),
+            &format!("{}/client/v4/", cloudflare.uri()),
+        )
+        .expect("account-token client should be valid");
+        let public_ip = PublicIpClient::new_for_tests(Duration::from_secs(2))
+            .expect("test IP client should be valid");
+        let mut test_config = config(
+            format!("{}/ip", ip.uri()),
+            vec![record("home.example.com", false)],
+        );
+        test_config.cloudflare.account_id = Some(ACCOUNT_ID.to_owned());
+        let updater = Updater::new_for_test(test_config, client, public_ip);
+
+        let report = updater.check(false, true).await;
+
+        assert!(report.is_success());
+        assert!(report.authenticated);
+        assert!(report.edit_permission_verified);
+        assert_eq!(report.edit_verified_zones, 1);
+        assert_eq!(report.existing, 1);
+    }
+
+    #[tokio::test]
+    async fn authentication_abort_reports_only_the_root_failure() {
+        let cloudflare = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/user/tokens/verify"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "success": false,
+                "errors": [{"code": 1000, "message": "invalid token"}],
+                "messages": [],
+                "result": null
+            })))
+            .expect(1)
+            .mount(&cloudflare)
+            .await;
+        let token = SecretString::new("test-token".to_owned());
+        let client = CloudflareClient::new_for_test(
+            &token,
+            Duration::from_secs(2),
+            &format!("{}/client/v4/", cloudflare.uri()),
+        )
+        .expect("test Cloudflare client should be valid");
+        let public_ip = PublicIpClient::new_for_tests(Duration::from_secs(2))
+            .expect("test IP client should be valid");
+        let updater = Updater::new_for_test(
+            config(
+                "http://127.0.0.1:1/ip".to_owned(),
+                vec![record("home.example.com", false)],
+            ),
+            client,
+            public_ip,
+        );
+
+        let report = updater.check(false, false).await;
+
+        assert!(!report.is_success());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].stage,
+            super::FailureStage::Authentication
+        );
+        assert_eq!(report.failures[0].kind, FailureKind::Authentication);
+        assert!(!report.edit_permission_verified);
+    }
+
+    #[tokio::test]
+    async fn forbidden_account_verification_aborts_before_zone_or_dns_work() {
+        let cloudflare = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/client/v4/accounts/{ACCOUNT_ID}/tokens/verify"
+            )))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "success": false,
+                "errors": [{"code": 1000, "message": "forbidden"}],
+                "messages": [],
+                "result": null
+            })))
+            .expect(1)
+            .mount(&cloudflare)
+            .await;
+        let token = SecretString::new("cfat_test-account-token".to_owned());
+        let client = CloudflareClient::new_for_test_with_account_id(
+            &token,
+            ACCOUNT_ID,
+            Duration::from_secs(2),
+            &format!("{}/client/v4/", cloudflare.uri()),
+        )
+        .expect("account-token client should be valid");
+        let public_ip = PublicIpClient::new_for_tests(Duration::from_secs(2))
+            .expect("test IP client should be valid");
+        let updater = Updater::new_for_test(
+            config(
+                "http://127.0.0.1:1/ip".to_owned(),
+                vec![record("home.example.com", false)],
+            ),
+            client,
+            public_ip,
+        );
+
+        let report = updater.check(false, false).await;
+
+        assert!(!report.is_success());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].stage,
+            super::FailureStage::Authentication
+        );
+        assert!(report.failures[0].message.contains("cloudflare.account_id"));
+        let requests = cloudflare
+            .received_requests()
+            .await
+            .expect("request recording should be enabled");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url.path(),
+            format!("/client/v4/accounts/{ACCOUNT_ID}/tokens/verify")
+        );
     }
 
     #[tokio::test]

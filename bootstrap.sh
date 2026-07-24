@@ -95,6 +95,7 @@ INCOMPLETE_INSTALL=false
 INPUT_TOKEN_FILE=""
 INPUT_TOKEN_VALUE=""
 INPUT_ZONE=""
+INPUT_ACCOUNT_ID=""
 INPUT_RECORD=""
 INPUT_IPV4=""
 INPUT_IPV6=""
@@ -594,6 +595,8 @@ Non-interactive environment:
   CIRRUSYNC_TOKEN       Token value (less safe; may be exposed to privileged
                         process inspection or inherited environments).
   CIRRUSYNC_ZONE        Cloudflare zone, for example example.com.
+  CIRRUSYNC_ACCOUNT_ID  Account ID for an account-owned API token; omit for a
+                        user-owned API token.
   CIRRUSYNC_RECORD      Record name, for example home.example.com.
   CIRRUSYNC_ENABLE_IPV4 true or false (default: true).
   CIRRUSYNC_ENABLE_IPV6 true or false (default: false).
@@ -686,7 +689,7 @@ ensure_root() {
     if [[ -f "${BASH_SOURCE[0]}" && -r "${BASH_SOURCE[0]}" ]]; then
         log "Re-executing the installer through sudo"
         exec sudo \
-            --preserve-env=CIRRUSYNC_TOKEN_FILE,CIRRUSYNC_TOKEN,CIRRUSYNC_ZONE,CIRRUSYNC_RECORD,CIRRUSYNC_ENABLE_IPV4,CIRRUSYNC_ENABLE_IPV6,CIRRUSYNC_INTERVAL,CIRRUSYNC_CREATE,CIRRUSYNC_PROXIED,CFDDNS_TOKEN_FILE,CFDDNS_TOKEN,CFDDNS_ZONE,CFDDNS_RECORD,CFDDNS_ENABLE_IPV4,CFDDNS_ENABLE_IPV6,CFDDNS_INTERVAL,CFDDNS_CREATE,CFDDNS_PROXIED \
+            --preserve-env=CIRRUSYNC_TOKEN_FILE,CIRRUSYNC_TOKEN,CIRRUSYNC_ZONE,CIRRUSYNC_ACCOUNT_ID,CIRRUSYNC_RECORD,CIRRUSYNC_ENABLE_IPV4,CIRRUSYNC_ENABLE_IPV6,CIRRUSYNC_INTERVAL,CIRRUSYNC_CREATE,CIRRUSYNC_PROXIED,CFDDNS_TOKEN_FILE,CFDDNS_TOKEN,CFDDNS_ZONE,CFDDNS_ACCOUNT_ID,CFDDNS_RECORD,CFDDNS_ENABLE_IPV4,CFDDNS_ENABLE_IPV6,CFDDNS_INTERVAL,CFDDNS_CREATE,CFDDNS_PROXIED \
             bash "${BASH_SOURCE[0]}" "$@"
     fi
 
@@ -699,6 +702,7 @@ capture_install_environment() {
     INPUT_TOKEN_FILE="${CIRRUSYNC_TOKEN_FILE:-${CFDDNS_TOKEN_FILE:-}}"
     INPUT_TOKEN_VALUE="${CIRRUSYNC_TOKEN:-${CFDDNS_TOKEN:-}}"
     INPUT_ZONE="${CIRRUSYNC_ZONE:-${CFDDNS_ZONE:-}}"
+    INPUT_ACCOUNT_ID="${CIRRUSYNC_ACCOUNT_ID:-${CFDDNS_ACCOUNT_ID:-}}"
     INPUT_RECORD="${CIRRUSYNC_RECORD:-${CFDDNS_RECORD:-}}"
     INPUT_IPV4="${CIRRUSYNC_ENABLE_IPV4:-${CFDDNS_ENABLE_IPV4:-}}"
     INPUT_IPV6="${CIRRUSYNC_ENABLE_IPV6:-${CFDDNS_ENABLE_IPV6:-}}"
@@ -707,10 +711,12 @@ capture_install_environment() {
     INPUT_PROXIED="${CIRRUSYNC_PROXIED:-${CFDDNS_PROXIED:-}}"
 
     unset \
-        CIRRUSYNC_TOKEN_FILE CIRRUSYNC_TOKEN CIRRUSYNC_ZONE CIRRUSYNC_RECORD \
+        CIRRUSYNC_TOKEN_FILE CIRRUSYNC_TOKEN CIRRUSYNC_ZONE \
+        CIRRUSYNC_ACCOUNT_ID CIRRUSYNC_RECORD \
         CIRRUSYNC_ENABLE_IPV4 CIRRUSYNC_ENABLE_IPV6 CIRRUSYNC_INTERVAL \
         CIRRUSYNC_CREATE CIRRUSYNC_PROXIED \
-        CFDDNS_TOKEN_FILE CFDDNS_TOKEN CFDDNS_ZONE CFDDNS_RECORD \
+        CFDDNS_TOKEN_FILE CFDDNS_TOKEN CFDDNS_ZONE CFDDNS_ACCOUNT_ID \
+        CFDDNS_RECORD \
         CFDDNS_ENABLE_IPV4 CFDDNS_ENABLE_IPV6 CFDDNS_INTERVAL \
         CFDDNS_CREATE CFDDNS_PROXIED
 }
@@ -1169,6 +1175,10 @@ validate_inputs() {
     if [[ -n "${TOKEN_INPUT_FILE}" ]]; then
         [[ "${TOKEN_INPUT_FILE}" == /* ]] ||
             die "--token-file must be an absolute path"
+    fi
+    if [[ -n "${INPUT_ACCOUNT_ID}" ]]; then
+        validate_cloudflare_account_id "${INPUT_ACCOUNT_ID}" ||
+            die "CIRRUSYNC_ACCOUNT_ID must be exactly 32 hexadecimal characters"
     fi
     validate_managed_paths
 }
@@ -2097,6 +2107,10 @@ validate_dns_name() {
     done
 }
 
+validate_cloudflare_account_id() {
+    [[ "$1" =~ ^[0-9A-Fa-f]{32}$ ]]
+}
+
 write_token() {
     local token_source="${TOKEN_INPUT_FILE}"
     local environment_token="${INPUT_TOKEN_VALUE}"
@@ -2214,6 +2228,7 @@ write_token() {
 
 write_configuration() {
     local zone=""
+    local account_id=""
     local record=""
     local ipv4=""
     local ipv6=""
@@ -2224,6 +2239,7 @@ write_configuration() {
     local zone_lower=""
     local record_lower=""
     local env_zone="${INPUT_ZONE}"
+    local env_account_id="${INPUT_ACCOUNT_ID}"
     local env_record="${INPUT_RECORD}"
     local env_ipv4="${INPUT_IPV4}"
     local env_ipv6="${INPUT_IPV6}"
@@ -2237,7 +2253,8 @@ write_configuration() {
             die "the existing configuration path must be a regular, non-symlink file"
         if [[ "${ACTION}" != reconfigure ]]; then
             if [[ "${INCOMPLETE_INSTALL}" == true &&
-                ( -n "${env_zone}" || -n "${env_record}" ||
+                ( -n "${env_zone}" || -n "${env_account_id}" ||
+                    -n "${env_record}" ||
                     -n "${env_ipv4}" || -n "${env_ipv6}" ||
                     -n "${env_interval}" || -n "${env_create}" ||
                     -n "${env_proxied}" ) ]]; then
@@ -2260,6 +2277,11 @@ write_configuration() {
     fi
 
     zone="$(prompt_value "Cloudflare zone" "" "${env_zone}")"
+    account_id="$(
+        prompt_value \
+            "Cloudflare account ID (required for account-owned tokens; blank for a user token)" \
+            "" "${env_account_id}"
+    )"
     record="$(prompt_value "DNS record name" "" "${env_record}")"
     ipv4="$(prompt_boolean "Enable IPv4 updates" true "${env_ipv4}")"
     ipv6="$(prompt_boolean "Enable IPv6 updates" false "${env_ipv6}")"
@@ -2269,6 +2291,11 @@ write_configuration() {
 
     zone="${zone%.}"
     record="${record%.}"
+    if [[ -n "${account_id}" ]]; then
+        validate_cloudflare_account_id "${account_id}" ||
+            die "the Cloudflare account ID must be exactly 32 hexadecimal characters"
+        account_id="${account_id,,}"
+    fi
     validate_dns_name "${zone}" || die "invalid Cloudflare zone: ${zone}"
     validate_dns_name "${record}" || die "invalid DNS record name: ${record}"
     zone_lower="${zone,,}"
@@ -2296,6 +2323,11 @@ request_timeout_seconds = 15
 
 [cloudflare]
 api_token_file = "${TOKEN_PATH}"
+EOF
+        if [[ -n "${account_id}" ]]; then
+            printf 'account_id = "%s"\n' "${account_id}"
+        fi
+        cat <<EOF
 
 [ipv4]
 enabled = ${ipv4}
@@ -2682,7 +2714,8 @@ main() {
     if [[ "${ACTION}" == update &&
         ( -n "${TOKEN_INPUT_FILE}" || -n "${INPUT_TOKEN_FILE}" ||
             -n "${INPUT_TOKEN_VALUE}" || -n "${INPUT_ZONE}" ||
-            -n "${INPUT_RECORD}" || -n "${INPUT_IPV4}" ||
+            -n "${INPUT_ACCOUNT_ID}" || -n "${INPUT_RECORD}" ||
+            -n "${INPUT_IPV4}" ||
             -n "${INPUT_IPV6}" || -n "${INPUT_INTERVAL}" ||
             -n "${INPUT_CREATE}" || -n "${INPUT_PROXIED}" ) ]]; then
         die "configuration inputs are not applied during update; use --reconfigure"

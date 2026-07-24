@@ -26,7 +26,9 @@ disclosure.
 ## Operational security
 
 Use a Cloudflare API token restricted to only the required zones with `Zone
-Read` and `DNS Edit` permissions. Cirrusync does not need a Global API Key.
+Read` and `DNS Edit` permissions. Account-owned and user-owned API tokens are
+supported; account-owned tokens also require their non-secret Account ID in
+the configuration. Cirrusync does not need a Global API Key.
 Keep `/etc/cirrusync/token` owned by `root:cirrusync` with mode `0640`, or use
 an equivalently restrictive arrangement that still permits the unprivileged
 service account to read it. Do not add access ACLs or other users to the

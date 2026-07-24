@@ -64,6 +64,62 @@ test_argument_modes() {
         parse_arguments --update --reconfigure
 }
 
+test_account_id_input_handling() {
+    (
+        export CIRRUSYNC_ACCOUNT_ID="ABCDEF0123456789ABCDEF0123456789"
+        export CFDDNS_ACCOUNT_ID="ffffffffffffffffffffffffffffffff"
+        capture_install_environment
+        [[ "${INPUT_ACCOUNT_ID}" == \
+            "ABCDEF0123456789ABCDEF0123456789" ]]
+        [[ -z "${CIRRUSYNC_ACCOUNT_ID+x}" ]]
+        [[ -z "${CFDDNS_ACCOUNT_ID+x}" ]]
+    ) || fail "the Cloudflare account ID was not safely captured and cleared"
+
+    validate_cloudflare_account_id \
+        "ABCDEF0123456789abcdef0123456789" ||
+        fail "a valid Cloudflare account ID was rejected"
+    expect_failure "short Cloudflare account ID" \
+        validate_cloudflare_account_id "0123456789abcdef"
+    expect_failure "non-hexadecimal Cloudflare account ID" \
+        validate_cloudflare_account_id "g123456789abcdef0123456789abcdef"
+}
+
+test_account_id_configuration_generation() {
+    (
+        # These locals are consumed dynamically by the sourced installer
+        # functions under test.
+        # shellcheck disable=SC2034
+        local CONFIG_DIR="${CONFIG_ROOT}" \
+            CONFIG_PATH="${CONFIG_ROOT}/account-token.toml" \
+            TOKEN_PATH="${CONFIG_ROOT}/token" \
+            INPUT_ZONE="example.com" \
+            INPUT_ACCOUNT_ID="ABCDEF0123456789ABCDEF0123456789" \
+            INPUT_RECORD="home.example.com" \
+            INPUT_IPV4=true \
+            INPUT_IPV6=false \
+            INPUT_INTERVAL=300 \
+            INPUT_CREATE=false \
+            INPUT_PROXIED=false \
+            NON_INTERACTIVE=true \
+            ACTION=install
+        mkdir -p -- "${CONFIG_DIR}"
+        write_token() { :; }
+        chown() { :; }
+
+        write_configuration
+
+        grep -Fqx \
+            'account_id = "abcdef0123456789abcdef0123456789"' \
+            "${CONFIG_PATH}"
+
+        CONFIG_PATH="${CONFIG_ROOT}/user-token.toml"
+        INPUT_ACCOUNT_ID=""
+        write_configuration
+
+        ! grep -Fq 'account_id' "${CONFIG_PATH}"
+    ) || fail "account- and user-token configuration generation was incorrect"
+}
+
 test_rollback_failure_reporting() {
     local output=""
 
@@ -1131,6 +1187,8 @@ test_repository_history_protection() {
 
 test_repository_validation
 test_argument_modes
+test_account_id_input_handling
+test_account_id_configuration_generation
 test_rollback_failure_reporting
 test_new_state_directory_cleanup_is_bounded
 test_snapshot_restore
