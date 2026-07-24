@@ -298,7 +298,8 @@ cleanup() {
         printf 'temporary toolchain preserved for recovery at %s\n' \
             "${TOOLCHAIN_ROOT}" >&2
         exit_code=1
-    elif [[ "${TOOLCHAIN_ROOT}" == /opt/cirrusync-bootstrap-ci.* ]]; then
+    elif [[ "${TOOLCHAIN_ROOT}" == \
+        /usr/local/lib/cirrusync-bootstrap-ci.* ]]; then
         "${SUDO[@]}" rm -rf -- "${TOOLCHAIN_ROOT}"
     fi
     rm -rf -- "${WORKSPACE}"
@@ -339,9 +340,12 @@ install_trusted_system_toolchain() {
     [[ "${rustc_path}" == "${source_root}/bin/rustc" ]] ||
         fail "stable cargo and rustc do not share one toolchain"
 
-    TOOLCHAIN_ROOT="/opt/cirrusync-bootstrap-ci.${BASHPID}"
+    # GitHub-hosted runners make /opt writable. Use a protected system subtree
+    # so the fixture satisfies the installer's trusted-ancestor policy.
+    TOOLCHAIN_ROOT="$("${SUDO[@]}" mktemp -d \
+        /usr/local/lib/cirrusync-bootstrap-ci.XXXXXX)"
     "${SUDO[@]}" cp --archive --reflink=auto -- \
-        "${source_root}" "${TOOLCHAIN_ROOT}"
+        "${source_root}/." "${TOOLCHAIN_ROOT}/"
     "${SUDO[@]}" chown --recursive root:root "${TOOLCHAIN_ROOT}"
     "${SUDO[@]}" chmod --recursive a+rX,go-w "${TOOLCHAIN_ROOT}"
 
