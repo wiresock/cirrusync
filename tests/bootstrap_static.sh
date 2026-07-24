@@ -60,6 +60,7 @@ assert_contains "${BOOTSTRAP}" 'run_without_privilege_gain "${BUILD_USER}" env -
 assert_contains "${BOOTSTRAP}" 'setpriv --no-new-privs'
 assert_contains "${BOOTSTRAP}" '"RUSTC=${RUSTC_BIN}"'
 assert_contains "${BOOTSTRAP}" 'validate_existing_token_before_build'
+assert_contains "${BOOTSTRAP}" 'validate_configuration_directory_acl'
 assert_contains "${BOOTSTRAP}" 'getfacl --absolute-names --numeric --omit-header'
 assert_contains "${BOOTSTRAP}" '"GIT_CONFIG_GLOBAL=${GIT_SAFE_CONFIG}"'
 assert_contains "${BOOTSTRAP}" 'chown "root:${BUILD_GROUP}" "${GIT_SAFE_CONFIG}"'

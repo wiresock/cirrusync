@@ -417,6 +417,19 @@ test_existing_token_is_safe_before_build() {
 }
 
 test_configuration_directory_acl_is_rejected_before_secret_writes() {
+    local transaction_marker="${BOOTSTRAP_TEST_ROOT}/acl-transaction-started"
+
+    (
+        # Fresh installs have no configuration directory yet and must not
+        # require getfacl until the installer creates one.
+        # shellcheck disable=SC2034
+        CONFIG_DIR="${CONFIG_ROOT}/missing"
+        rm -rf -- "${CONFIG_DIR}"
+        getfacl() { return 1; }
+
+        validate_configuration_directory_acl
+    ) || fail "a missing configuration directory was rejected"
+
     (
         # These globals are consumed by the sourced hardening function.
         # shellcheck disable=SC2034
@@ -437,8 +450,32 @@ test_configuration_directory_acl_is_rejected_before_secret_writes() {
         }
 
         expect_failure "configuration directory default ACL" \
+            validate_configuration_directory_acl
+        expect_failure "configuration directory default ACL after preflight" \
             secure_existing_configuration_files
     ) || fail "a default ACL that could expose a new token was accepted"
+
+    rm -f -- "${transaction_marker}"
+    (
+        # The preflight must run before begin_transaction creates rollback
+        # state or can stop an active service.
+        # shellcheck disable=SC2034
+        CONFIG_DIR="${CONFIG_ROOT}"
+        # shellcheck disable=SC2034
+        TRANSACTION_ACTIVE=false
+        getfacl() {
+            printf 'user::rwx\ngroup::r-x\nother::---\ndefault:user::rwx\n'
+        }
+        mktemp() {
+            : >"${transaction_marker}"
+            return 1
+        }
+
+        expect_failure "transaction with a configuration directory ACL" \
+            begin_transaction
+    ) || fail "transaction ACL preflight did not fail safely"
+    [[ ! -e "${transaction_marker}" ]] ||
+        fail "transaction state was created before directory ACL validation"
 
     (
         # These globals are consumed by the sourced hardening function.

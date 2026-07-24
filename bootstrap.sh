@@ -235,6 +235,10 @@ begin_transaction() {
     [[ "${TRANSACTION_ACTIVE}" == false ]] ||
         die "internal error: an installation transaction is already active"
 
+    # Reject known-unsafe directory metadata before an active service is
+    # stopped. The hardening step repeats this after the transaction begins.
+    validate_configuration_directory_acl
+
     PRESERVE_ROLLBACK=false
     ROLLBACK_DIR="$(mktemp -d /var/tmp/cirrusync-rollback.XXXXXX)"
     chmod 0700 "${ROLLBACK_DIR}"
@@ -1956,11 +1960,11 @@ create_service_account() {
     install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0750 "${STATE_DIR}"
 }
 
-secure_existing_configuration_files() {
+validate_configuration_directory_acl() {
     local directory_acl=""
     local acl_line=""
-    local path=""
 
+    [[ -d "${CONFIG_DIR}" ]] || return 0
     command -v getfacl >/dev/null 2>&1 ||
         die "getfacl is required to verify configuration directory access controls"
     directory_acl="$(getfacl --absolute-names --numeric --omit-header \
@@ -1974,6 +1978,15 @@ secure_existing_configuration_files() {
                 ;;
         esac
     done <<<"${directory_acl}"
+    return 0
+}
+
+secure_existing_configuration_files() {
+    local path=""
+
+    # Check again after the service has stopped so a directory ACL changed
+    # between preflight validation and the transaction cannot expose secrets.
+    validate_configuration_directory_acl
 
     for path in "${CONFIG_PATH}" "${TOKEN_PATH}"; do
         if [[ -e "${path}" || -L "${path}" ]]; then
@@ -2671,6 +2684,7 @@ main() {
     case "${ACTION}" in
         install | update)
             install_dependencies
+            validate_configuration_directory_acl
             create_build_account
             validate_existing_token_before_build
             ensure_rust

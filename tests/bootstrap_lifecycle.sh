@@ -562,6 +562,12 @@ run_runtime_file_boundary_checks() {
 
 run_prebuild_boundary_checks() {
     local failure_log="${WORKSPACE}/prebuild-boundary-failure.log"
+    local reconfigure_succeeded=false
+    local service_active_during_rejection=false
+    local service_invocation_after=""
+    local service_invocation_before=""
+    local service_pid_after=""
+    local service_pid_before=""
     local token_hash=""
 
     "${SUDO[@]}" chmod 0644 "${TOKEN_PATH}"
@@ -591,6 +597,16 @@ run_prebuild_boundary_checks() {
     "${SUDO[@]}" chmod 0755 "${BINARY_PATH}"
 
     token_hash="$("${SUDO[@]}" sha256sum "${TOKEN_PATH}")"
+    service_pid_before="$("${SUDO[@]}" systemctl show \
+        --property=MainPID --value cirrusync.service)" ||
+        fail "could not read the active service PID before the ACL check"
+    [[ "${service_pid_before}" =~ ^[1-9][0-9]*$ ]] ||
+        fail "the service had no main process before the ACL check"
+    service_invocation_before="$("${SUDO[@]}" systemctl show \
+        --property=InvocationID --value cirrusync.service)" ||
+        fail "could not read the service invocation before the ACL check"
+    [[ "${service_invocation_before}" =~ ^[0-9a-fA-F]{32}$ ]] ||
+        fail "the service had no invocation ID before the ACL check"
     "${SUDO[@]}" setfacl --modify \
         default:user:cirrusync-build:r-x "${CONFIG_DIR}"
     if "${SUDO[@]}" env \
@@ -605,16 +621,32 @@ run_prebuild_boundary_checks() {
         bash "${REPOSITORY_ROOT}/bootstrap.sh" \
         --non-interactive \
         --reconfigure >"${failure_log}" 2>&1; then
-        "${SUDO[@]}" setfacl --remove-default "${CONFIG_DIR}"
-        fail "installer accepted a configuration directory with a default ACL"
+        reconfigure_succeeded=true
+    fi
+    if "${SUDO[@]}" systemctl is-active --quiet cirrusync.service; then
+        service_active_during_rejection=true
+        if service_pid_after="$("${SUDO[@]}" systemctl show \
+            --property=MainPID --value cirrusync.service 2>/dev/null)" &&
+            service_invocation_after="$("${SUDO[@]}" systemctl show \
+                --property=InvocationID --value \
+                cirrusync.service 2>/dev/null)"; then
+            :
+        else
+            service_active_during_rejection=false
+        fi
     fi
     "${SUDO[@]}" setfacl --remove-default "${CONFIG_DIR}"
+    [[ "${reconfigure_succeeded}" == false ]] ||
+        fail "installer accepted a configuration directory with a default ACL"
     grep -Fq 'extended or default ACL' "${failure_log}" ||
         fail "installer did not diagnose the configuration directory ACL"
     [[ "$("${SUDO[@]}" sha256sum "${TOKEN_PATH}")" == "${token_hash}" ]] ||
         fail "directory ACL rejection modified the installed token"
-    "${SUDO[@]}" systemctl is-active --quiet cirrusync.service ||
-        fail "directory ACL rejection did not restore the active service"
+    [[ "${service_active_during_rejection}" == true ]] ||
+        fail "directory ACL rejection stopped the active service"
+    [[ "${service_pid_after}" == "${service_pid_before}" &&
+        "${service_invocation_after}" == "${service_invocation_before}" ]] ||
+        fail "directory ACL rejection restarted the active service"
 }
 
 run_update_and_fsmonitor_check() {
