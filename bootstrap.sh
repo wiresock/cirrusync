@@ -40,6 +40,8 @@ readonly BUILD_STATE_DIR="${BOOTSTRAP_ROOT}/var/lib/cirrusync-build"
 readonly UNIT_PATH="${BOOTSTRAP_ROOT}/etc/systemd/system/cirrusync.service"
 readonly UNIT_OVERRIDE_DIR="${BOOTSTRAP_ROOT}/etc/systemd/system/cirrusync.service.d"
 readonly UNIT_OVERRIDE_PATH="${UNIT_OVERRIDE_DIR}/10-config-path.conf"
+readonly PERSISTENT_ENABLEMENT_PATH="${BOOTSTRAP_ROOT}/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}"
+readonly RUNTIME_ENABLEMENT_PATH="${BOOTSTRAP_ROOT}/run/systemd/system/multi-user.target.wants/${SERVICE_NAME}"
 readonly CONFIG_ROOT="${BOOTSTRAP_ROOT}/etc/cirrusync"
 readonly DEFAULT_CONFIG_PATH="${CONFIG_ROOT}/config.toml"
 readonly DEFAULT_REPOSITORY="https://github.com/wiresock/cirrusync.git"
@@ -922,20 +924,83 @@ read_service_activity() {
 
 read_service_enablement() {
     local enable_state=""
+    local inferred_enablement=""
     local load_state=""
 
     load_state="$(systemctl show --property=LoadState --value \
         "${SERVICE_NAME}" 2>/dev/null)" || return 1
     if [[ "${load_state}" == not-found ]]; then
-        printf '%s' disabled
+        if [[ ! -e "${UNIT_PATH}" && ! -L "${UNIT_PATH}" ]]; then
+            inferred_enablement="$(infer_missing_unit_enablement)" ||
+                return 1
+            printf '%s' "${inferred_enablement}"
+        else
+            printf '%s' disabled
+        fi
         return 0
     fi
     [[ "${load_state}" == loaded ]] || return 1
     enable_state="$(systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null)" || true
     case "${enable_state}" in
         enabled | enabled-runtime | disabled) printf '%s' "${enable_state}" ;;
+        "" | not-found)
+            inferred_enablement="$(infer_missing_unit_enablement)" ||
+                return 1
+            printf '%s' "${inferred_enablement}"
+            ;;
         *) return 1 ;;
     esac
+}
+
+enablement_link_targets_managed_unit() {
+    local link_path="$1"
+    local target=""
+
+    [[ -L "${link_path}" ]] || return 1
+    target="$(readlink -- "${link_path}")" || return 1
+    if [[ "${target}" == "${UNIT_PATH}" ]]; then
+        return 0
+    fi
+    [[ "${link_path}" == "${PERSISTENT_ENABLEMENT_PATH}" &&
+        "${target}" == "../${SERVICE_NAME}" ]]
+}
+
+infer_missing_unit_enablement() {
+    local persistent_enabled=false
+    local runtime_enabled=false
+
+    # systemd may retain an active unit in memory after its fragment was
+    # deleted. In that repair state, is-enabled reports not-found even though
+    # the exact enablement symlink still records the prior state.
+    [[ ! -e "${UNIT_PATH}" && ! -L "${UNIT_PATH}" ]] || return 1
+
+    if [[ -e "${PERSISTENT_ENABLEMENT_PATH}" &&
+        ! -L "${PERSISTENT_ENABLEMENT_PATH}" ]]; then
+        return 1
+    fi
+    if [[ -L "${PERSISTENT_ENABLEMENT_PATH}" ]]; then
+        enablement_link_targets_managed_unit \
+            "${PERSISTENT_ENABLEMENT_PATH}" || return 1
+        persistent_enabled=true
+    fi
+
+    if [[ -e "${RUNTIME_ENABLEMENT_PATH}" &&
+        ! -L "${RUNTIME_ENABLEMENT_PATH}" ]]; then
+        return 1
+    fi
+    if [[ -L "${RUNTIME_ENABLEMENT_PATH}" ]]; then
+        enablement_link_targets_managed_unit \
+            "${RUNTIME_ENABLEMENT_PATH}" || return 1
+        runtime_enabled=true
+    fi
+
+    if [[ "${persistent_enabled}" == true ]]; then
+        printf '%s' enabled
+    elif [[ "${runtime_enabled}" == true ]]; then
+        printf '%s' enabled-runtime
+    else
+        printf '%s' disabled
+    fi
 }
 
 wait_for_service_quiescence() {
