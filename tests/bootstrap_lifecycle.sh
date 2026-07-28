@@ -31,6 +31,7 @@ readonly STATE_DIR="/var/lib/cirrusync"
 readonly BUILD_STATE_DIR="/var/lib/cirrusync-build"
 readonly TOOLCHAIN_CARGO_LINK="/usr/sbin/cargo"
 readonly TOOLCHAIN_RUSTC_LINK="/usr/sbin/rustc"
+readonly VERSIONING_SCRIPT="${REPOSITORY_ROOT}/scripts/versioning.py"
 
 if ((EUID == 0)); then
     SUDO=()
@@ -62,6 +63,9 @@ LOCAL_SRC_MODE_CHANGE_ATTEMPTED=false
 CA_INSTALLED=false
 CA_HOOKS_DIR_ATTEMPTED=false
 HOSTS_CHANGED=false
+INITIAL_VERSION=""
+UPGRADE_VERSION=""
+PYTHON_BIN=""
 
 fail() {
     printf 'bootstrap lifecycle test failed: %s\n' "$*" >&2
@@ -453,6 +457,53 @@ require_command() {
         fail "required command is missing: $1"
 }
 
+advance_fixture_repository_version() {
+    local source="${WORKSPACE}/source"
+    local bare_repository="${WORKSPACE}/https-root/repo.git"
+
+    [[ -n "${INITIAL_VERSION}" && -z "${UPGRADE_VERSION}" ]] ||
+        fail "fixture version transition was requested in an invalid state"
+    UPGRADE_VERSION="$("${PYTHON_BIN}" "${VERSIONING_SCRIPT}" \
+        --root "${source}" bump patch)" ||
+        fail "could not advance the lifecycle fixture package version"
+    [[ "${UPGRADE_VERSION}" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ &&
+        "${UPGRADE_VERSION}" != "${INITIAL_VERSION}" ]] ||
+        fail "fixture version helper returned an invalid upgrade version: ${UPGRADE_VERSION}"
+    [[ "$("${PYTHON_BIN}" "${VERSIONING_SCRIPT}" \
+        --root "${source}" get)" == "${UPGRADE_VERSION}" ]] ||
+        fail "fixture manifest did not advance to ${UPGRADE_VERSION}"
+
+    git -C "${source}" add Cargo.toml Cargo.lock
+    git -C "${source}" \
+        -c user.name="Cirrusync CI" \
+        -c user.email="ci@cirrusync.invalid" \
+        commit --quiet -m "Advance lifecycle fixture to ${UPGRADE_VERSION}"
+    git -C "${source}" push --quiet \
+        "${bare_repository}" "HEAD:refs/heads/${INTEGRATION_BRANCH}"
+    git --git-dir="${bare_repository}" update-server-info
+    chmod --recursive a+rX,go-w "${WORKSPACE}/https-root"
+}
+
+publish_fixture_downgrade() {
+    local source="${WORKSPACE}/source"
+    local bare_repository="${WORKSPACE}/https-root/repo.git"
+
+    [[ -n "${INITIAL_VERSION}" && -n "${UPGRADE_VERSION}" ]] ||
+        fail "fixture downgrade was requested before the upgrade version existed"
+    git -C "${source}" checkout --quiet HEAD^ -- Cargo.toml Cargo.lock
+    [[ "$("${PYTHON_BIN}" "${VERSIONING_SCRIPT}" \
+        --root "${source}" get)" == "${INITIAL_VERSION}" ]] ||
+        fail "fixture downgrade did not restore ${INITIAL_VERSION}"
+    git -C "${source}" \
+        -c user.name="Cirrusync CI" \
+        -c user.email="ci@cirrusync.invalid" \
+        commit --quiet -m "Publish lifecycle downgrade candidate"
+    git -C "${source}" push --quiet \
+        "${bare_repository}" "HEAD:refs/heads/${INTEGRATION_BRANCH}"
+    git --git-dir="${bare_repository}" update-server-info
+    chmod --recursive a+rX,go-w "${WORKSPACE}/https-root"
+}
+
 wait_for_fixture() {
     local attempt=""
 
@@ -522,6 +573,11 @@ prepare_repository() {
         -c user.name="Cirrusync CI" \
         -c user.email="ci@cirrusync.invalid" \
         commit --quiet -m "Use the lifecycle test's local Cargo vendor"
+    INITIAL_VERSION="$("${PYTHON_BIN}" "${VERSIONING_SCRIPT}" \
+        --root "${source}" get)" ||
+        fail "could not read the lifecycle fixture package version"
+    [[ "${INITIAL_VERSION}" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]] ||
+        fail "fixture version helper returned an invalid package version: ${INITIAL_VERSION}"
 
     install -d "${WORKSPACE}/https-root"
     git init --quiet --bare "${bare_repository}"
@@ -535,8 +591,6 @@ prepare_repository() {
 
 prepare_tls_and_hosts() {
     local tls="${WORKSPACE}/tls"
-    local python_path=""
-
     install -d "${tls}"
     openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
         -subj "/CN=Cirrusync bootstrap CI CA" \
@@ -581,7 +635,6 @@ prepare_tls_and_hosts() {
         "${FIXTURE_HOST}" |
         run_root_bounded 10s tee -a /etc/hosts >/dev/null
 
-    python_path="$(command -v python3)"
     # A transient unit gives the privileged fixture its own cgroup. Capturing
     # $! from `sudo python3 ... &` tracks sudo's supervisor on older releases,
     # so signal forwarding and wait(1) are not reliable cleanup primitives.
@@ -597,7 +650,7 @@ prepare_tls_and_hosts() {
         --property="StandardOutput=append:${MOCK_LOG}" \
         --property="StandardError=append:${MOCK_LOG}" \
         -- \
-        "${python_path}" \
+        "${PYTHON_BIN}" \
         "${REPOSITORY_ROOT}/tests/bootstrap_https_mock.py" \
         --root "${WORKSPACE}/https-root" \
         --certificate "${tls}/server.crt" \
@@ -656,6 +709,8 @@ run_failed_fresh_install_and_verify_rollback() {
 }
 
 run_install() {
+    local installed_version=""
+
     "${SUDO[@]}" env \
         CIRRUSYNC_TOKEN_FILE="${TOKEN_SOURCE}" \
         CIRRUSYNC_ZONE="example.test" \
@@ -678,6 +733,11 @@ run_install() {
         fail "fresh install did not enable the service"
     "${SUDO[@]}" test -x "${BINARY_PATH}" ||
         fail "fresh install did not install the binary"
+    installed_version="$("${SUDO[@]}" runuser --user cirrusync -- \
+        "${BINARY_PATH}" --version)" ||
+        fail "freshly installed binary did not report its version"
+    [[ "${installed_version}" == "cirrusync ${INITIAL_VERSION}" ]] ||
+        fail "fresh install reported ${installed_version}, expected cirrusync ${INITIAL_VERSION}"
     "${SUDO[@]}" test -f "${CONFIG_PATH}" ||
         fail "fresh install did not write the configuration"
     "${SUDO[@]}" grep -Fqx \
@@ -819,11 +879,24 @@ run_prebuild_boundary_checks() {
         fail "directory ACL rejection restarted the active service"
 }
 
-run_update_and_fsmonitor_check() {
+run_upgrade_and_fsmonitor_check() {
+    local binary_hash_after=""
+    local binary_hash_before=""
     local build_uid=""
+    local first_upgrade_log="${WORKSPACE}/first-upgrade.log"
+    local downgrade_log="${WORKSPACE}/downgrade-rejection.log"
+    local installed_version=""
+    local invocation_after=""
+    local invocation_before=""
     local observed_uid=""
+    local pid_after=""
+    local pid_before=""
     local probe_pid=""
     local probe_path="${SOURCE_DIR}/.git/cirrusync-fsmonitor-probe"
+    local repair_log="${WORKSPACE}/incomplete-upgrade-repair.log"
+    local runtime_repair_log="${WORKSPACE}/runtime-state-repair.log"
+    local second_upgrade_log="${WORKSPACE}/second-upgrade.log"
+    local service_gid=""
 
     build_uid="$(id -u cirrusync-build)"
     "${SUDO[@]}" install -o root -g root -m 0755 \
@@ -836,15 +909,19 @@ run_update_and_fsmonitor_check() {
         "${FSMONITOR_PID_FILE}" \
         "${FSMONITOR_CONTAMINATION}"
 
-    "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    advance_fixture_repository_version
+
+    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --non-interactive \
         --skip-tests \
-        --update
+        --upgrade >"${first_upgrade_log}" 2>&1; then
+        fail_with_log "version-aware upgrade failed" "${first_upgrade_log}"
+    fi
 
     "${SUDO[@]}" test -f "${FSMONITOR_MARKER}" ||
-        fail "repository-local core.fsmonitor was not exercised during update"
+        fail "repository-local core.fsmonitor was not exercised during upgrade"
     observed_uid="$("${SUDO[@]}" stat -c '%u' "${FSMONITOR_MARKER}")"
     [[ "${observed_uid}" == "${build_uid}" && "${observed_uid}" != 0 ]] ||
         fail "core.fsmonitor ran as UID ${observed_uid}, expected build UID ${build_uid}"
@@ -854,12 +931,147 @@ run_update_and_fsmonitor_check() {
     [[ "${probe_pid}" =~ ^[0-9]+$ ]] ||
         fail "core.fsmonitor wrote an invalid process identifier"
     if "${SUDO[@]}" kill -0 "${probe_pid}" 2>/dev/null; then
-        fail "update retained a process launched by the old checkout"
+        fail "upgrade retained a process launched by the old checkout"
     fi
     "${SUDO[@]}" test ! -e "${FSMONITOR_CONTAMINATION}" ||
-        fail "old-checkout process reached the new staged source tree"
+        fail "old-checkout process reached the upgraded staged source tree"
     "${SUDO[@]}" systemctl is-active --quiet cirrusync.service ||
-        fail "update did not leave the service active"
+        fail "upgrade did not leave the service active"
+    installed_version="$("${SUDO[@]}" runuser --user cirrusync -- \
+        "${BINARY_PATH}" --version)" ||
+        fail "upgraded binary did not report its version"
+    [[ "${installed_version}" == "cirrusync ${UPGRADE_VERSION}" ]] ||
+        fail "upgrade reported ${installed_version}, expected cirrusync ${UPGRADE_VERSION}"
+
+    binary_hash_before="$("${SUDO[@]}" sha256sum "${BINARY_PATH}")"
+    pid_before="$("${SUDO[@]}" systemctl show \
+        --property=MainPID --value cirrusync.service)" ||
+        fail "could not read the service PID before the no-op upgrade"
+    invocation_before="$("${SUDO[@]}" systemctl show \
+        --property=InvocationID --value cirrusync.service)" ||
+        fail "could not read the service invocation before the no-op upgrade"
+    [[ "${pid_before}" =~ ^[1-9][0-9]*$ &&
+        "${invocation_before}" =~ ^[0-9a-fA-F]{32}$ ]] ||
+        fail "service identity was invalid before the no-op upgrade"
+
+    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+        --repo "${REPOSITORY_URL}" \
+        --branch "${INTEGRATION_BRANCH}" \
+        --non-interactive \
+        --skip-tests \
+        --upgrade >"${second_upgrade_log}" 2>&1; then
+        fail_with_log "identical version upgrade failed" "${second_upgrade_log}"
+    fi
+
+    grep -Fq "Cirrusync ${UPGRADE_VERSION} is already current" \
+        "${second_upgrade_log}" ||
+        fail_with_log "identical upgrade did not report its no-op" \
+            "${second_upgrade_log}"
+    grep -Fq "No Cirrusync files were" "${second_upgrade_log}" ||
+        fail_with_log "identical upgrade did not describe preserved state" \
+            "${second_upgrade_log}"
+    binary_hash_after="$("${SUDO[@]}" sha256sum "${BINARY_PATH}")"
+    pid_after="$("${SUDO[@]}" systemctl show \
+        --property=MainPID --value cirrusync.service)" ||
+        fail "could not read the service PID after the no-op upgrade"
+    invocation_after="$("${SUDO[@]}" systemctl show \
+        --property=InvocationID --value cirrusync.service)" ||
+        fail "could not read the service invocation after the no-op upgrade"
+    [[ "${binary_hash_after}" == "${binary_hash_before}" ]] ||
+        fail "identical version upgrade replaced the installed binary"
+    [[ "${pid_after}" == "${pid_before}" &&
+        "${invocation_after}" == "${invocation_before}" ]] ||
+        fail "identical version upgrade restarted the service"
+    "${SUDO[@]}" systemctl is-active --quiet cirrusync.service ||
+        fail "identical version upgrade did not leave the service active"
+
+    service_gid="$("${SUDO[@]}" getent group cirrusync | cut -d: -f3)"
+    [[ "${service_gid}" =~ ^[1-9][0-9]*$ ]] ||
+        fail "could not resolve the service group before runtime repair"
+    "${SUDO[@]}" chown root:root "${CONFIG_PATH}" "${TOKEN_PATH}"
+    "${SUDO[@]}" chmod 0600 "${CONFIG_PATH}" "${TOKEN_PATH}"
+
+    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+        --repo "${REPOSITORY_URL}" \
+        --branch "${INTEGRATION_BRANCH}" \
+        --non-interactive \
+        --skip-tests \
+        --upgrade >"${runtime_repair_log}" 2>&1; then
+        fail_with_log "runtime-state repair failed" "${runtime_repair_log}"
+    fi
+    grep -Fq \
+        "Installed runtime state needs repair; rebuilding the current release" \
+        "${runtime_repair_log}" ||
+        fail_with_log "permission drift bypassed runtime-state inspection" \
+            "${runtime_repair_log}"
+    grep -Fq "Repairing the incomplete Cirrusync ${UPGRADE_VERSION} installation" \
+        "${runtime_repair_log}" ||
+        fail_with_log "runtime drift did not enter repair mode" \
+            "${runtime_repair_log}"
+    [[ "$("${SUDO[@]}" stat -c '%u:%g:%a' "${CONFIG_PATH}")" == \
+        "0:${service_gid}:640" ]] ||
+        fail "runtime repair did not normalize configuration permissions"
+    [[ "$("${SUDO[@]}" stat -c '%u:%g:%a' "${TOKEN_PATH}")" == \
+        "0:${service_gid}:640" ]] ||
+        fail "runtime repair did not normalize token permissions"
+    "${SUDO[@]}" systemctl is-active --quiet cirrusync.service ||
+        fail "runtime repair did not leave the service active"
+
+    "${SUDO[@]}" rm -f -- "${TOKEN_PATH}" "${UNIT_PATH}"
+    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+        --repo "${REPOSITORY_URL}" \
+        --branch "${INTEGRATION_BRANCH}" \
+        --config "${CONFIG_PATH}" \
+        --token-file "${TOKEN_SOURCE}" \
+        --non-interactive \
+        --skip-tests \
+        --upgrade >"${repair_log}" 2>&1; then
+        fail_with_log "incomplete equal-version repair failed" "${repair_log}"
+    fi
+    grep -Fq "Repairing the incomplete Cirrusync ${UPGRADE_VERSION} installation" \
+        "${repair_log}" ||
+        fail_with_log "incomplete upgrade did not enter repair mode" \
+            "${repair_log}"
+    "${SUDO[@]}" test -f "${TOKEN_PATH}" ||
+        fail "incomplete upgrade did not restore the token"
+    "${SUDO[@]}" test -f "${UNIT_PATH}" ||
+        fail "incomplete upgrade did not restore the systemd unit"
+    "${SUDO[@]}" systemctl is-active --quiet cirrusync.service ||
+        fail "incomplete upgrade repair did not leave the service active"
+
+    binary_hash_before="$("${SUDO[@]}" sha256sum "${BINARY_PATH}")"
+    pid_before="$("${SUDO[@]}" systemctl show \
+        --property=MainPID --value cirrusync.service)"
+    invocation_before="$("${SUDO[@]}" systemctl show \
+        --property=InvocationID --value cirrusync.service)"
+    publish_fixture_downgrade
+    if "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+        --repo "${REPOSITORY_URL}" \
+        --branch "${INTEGRATION_BRANCH}" \
+        --non-interactive \
+        --skip-tests \
+        --upgrade >"${downgrade_log}" 2>&1; then
+        fail "downgrade candidate was unexpectedly installed"
+    fi
+    grep -Fq \
+        "refusing to downgrade Cirrusync ${UPGRADE_VERSION} to ${INITIAL_VERSION}" \
+        "${downgrade_log}" ||
+        fail_with_log "downgrade rejection was not diagnosed" "${downgrade_log}"
+    [[ "$("${SUDO[@]}" sha256sum "${BINARY_PATH}")" == \
+        "${binary_hash_before}" ]] ||
+        fail "downgrade rejection changed the installed binary"
+    [[ "$("${SUDO[@]}" "${PYTHON_BIN}" "${VERSIONING_SCRIPT}" \
+        --root "${SOURCE_DIR}" get)" == "${UPGRADE_VERSION}" ]] ||
+        fail "downgrade rejection changed the managed source"
+    pid_after="$("${SUDO[@]}" systemctl show \
+        --property=MainPID --value cirrusync.service)"
+    invocation_after="$("${SUDO[@]}" systemctl show \
+        --property=InvocationID --value cirrusync.service)"
+    [[ "${pid_after}" == "${pid_before}" &&
+        "${invocation_after}" == "${invocation_before}" ]] ||
+        fail "downgrade rejection restarted the service"
+    "${SUDO[@]}" systemctl is-active --quiet cirrusync.service ||
+        fail "downgrade rejection did not leave the service active"
 }
 
 run_failed_reconfigure_and_verify_rollback() {
@@ -921,10 +1133,14 @@ run_noninteractive_uninstall() {
         fail "non-interactive uninstall deleted managed source without consent"
 }
 
-for command in cargo curl find git openssl python3 rustup setfacl \
+for command in cargo curl find git openssl prlimit python3 rustup setfacl \
     systemctl systemd-run timeout; do
     require_command "${command}"
 done
+PYTHON_BIN="$(command -v python3)"
+readonly PYTHON_BIN
+[[ -f "${VERSIONING_SCRIPT}" && ! -L "${VERSIONING_SCRIPT}" ]] ||
+    fail "version policy helper is missing or unsafe: ${VERSIONING_SCRIPT}"
 [[ -d /run/systemd/system ]] ||
     fail "bootstrap lifecycle test requires a systemd-booted disposable host"
 
@@ -939,7 +1155,7 @@ run_failed_fresh_install_and_verify_rollback
 run_install
 run_runtime_file_boundary_checks
 run_prebuild_boundary_checks
-run_update_and_fsmonitor_check
+run_upgrade_and_fsmonitor_check
 run_failed_reconfigure_and_verify_rollback
 run_noninteractive_uninstall
 

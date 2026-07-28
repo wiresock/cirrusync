@@ -62,7 +62,277 @@ test_argument_modes() {
 
     expect_failure "conflicting actions" \
         parse_arguments --update --reconfigure
+
+    (
+        UPDATE_REQUESTED=false
+        parse_arguments --upgrade
+        [[ "${UPDATE_REQUESTED}" == true ]]
+    ) || fail "--upgrade parsing did not select the upgrade path"
+
+    (
+        UPDATE_REQUESTED=false
+        FORCE_REINSTALL=false
+        parse_arguments --update --force-reinstall
+        [[ "${UPDATE_REQUESTED}" == true &&
+            "${FORCE_REINSTALL}" == true ]]
+    ) || fail "--update compatibility and --force-reinstall parsing failed"
+
+    expect_failure "force reinstall without upgrade" \
+        parse_arguments --force-reinstall
 }
+
+test_action_selection_and_override_detection() (
+    CONFIG_PATH="${DEFAULT_CONFIG_PATH}"
+    CONFIG_DIR="${CONFIG_PATH%/*}"
+    TOKEN_PATH="${CONFIG_DIR}/token"
+    mkdir -p -- \
+        "${BINARY_PATH%/*}" \
+        "${UNIT_PATH%/*}" \
+        "${CONFIG_DIR}" \
+        "${UNIT_OVERRIDE_DIR}"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"${BINARY_PATH}"
+    chmod 0755 "${BINARY_PATH}"
+    : >"${CONFIG_PATH}"
+    : >"${TOKEN_PATH}"
+    rm -f -- "${UNIT_PATH}" "${UNIT_OVERRIDE_PATH}"
+
+    read_from_tty() {
+        # Dynamically scoped local in choose_action.
+        # shellcheck disable=SC2034
+        selection=1
+    }
+    UPDATE_REQUESTED=false
+    RECONFIGURE_REQUESTED=false
+    # Consumed dynamically by choose_action.
+    # shellcheck disable=SC2034
+    UNINSTALL_REQUESTED=false
+    NON_INTERACTIVE=false
+    INCOMPLETE_INSTALL=false
+    choose_action >/dev/null
+    [[ "${ACTION}" == update && "${INCOMPLETE_INSTALL}" == true ]] ||
+        fail "interactive upgrade did not detect a missing managed unit"
+
+    : >"${UNIT_PATH}"
+    basic_installation_artifacts_are_present ||
+        fail "a complete default-config artifact set was rejected"
+    : >"${UNIT_OVERRIDE_PATH}"
+    expect_failure "stale default-config unit override" \
+        basic_installation_artifacts_are_present
+
+    CONFIG_PATH="${CONFIG_ROOT}/custom.toml"
+    CONFIG_DIR="${CONFIG_PATH%/*}"
+    : >"${CONFIG_PATH}"
+    rm -f -- "${UNIT_OVERRIDE_PATH}"
+    expect_failure "missing custom-config unit override" \
+        basic_installation_artifacts_are_present
+
+    {
+        printf '[Service]\n'
+        printf 'ExecStart=\n'
+        printf 'ExecStart=%s --config %s run\n' \
+            "${BINARY_PATH}" "${CONFIG_PATH}"
+        printf 'ReadOnlyPaths=%s\n' "${CONFIG_DIR}"
+    } >"${UNIT_OVERRIDE_PATH}"
+    unit_override_has_expected_content ||
+        fail "the canonical custom-config unit override was rejected"
+    printf '\n# stale\n' >>"${UNIT_OVERRIDE_PATH}"
+    expect_failure "stale custom-config unit override content" \
+        unit_override_has_expected_content
+
+    rm -f -- \
+        "${BINARY_PATH}" \
+        "${UNIT_PATH}" \
+        "${DEFAULT_CONFIG_PATH}" \
+        "${CONFIG_PATH}" \
+        "${TOKEN_PATH}" \
+        "${UNIT_OVERRIDE_PATH}"
+)
+
+test_release_version_helpers() {
+    local version=""
+    local invalid_versions=(
+        ""
+        "1"
+        "1.2"
+        "1.2.3.4"
+        "01.2.3"
+        "1.02.3"
+        "1.2.03"
+        "1.2.3-alpha"
+        "1.2.3+build"
+        "v1.2.3"
+        "1000000000.0.0"
+        $'1.2.3\n4.5.6'
+    )
+    local manifest_dir=""
+
+    for version in 0.0.0 0.1.0 1.2.3 999999999.999999999.999999999; do
+        release_version_is_valid "${version}" ||
+            fail "valid release version was rejected: ${version}"
+    done
+    for version in "${invalid_versions[@]}"; do
+        expect_failure "invalid release version ${version}" \
+            release_version_is_valid "${version}"
+    done
+
+    [[ "$(compare_release_versions 0.2.0 0.1.99)" == newer ]]
+    [[ "$(compare_release_versions 1.0.0 0.999999999.999999999)" == newer ]]
+    [[ "$(compare_release_versions 1.2.3 1.2.3)" == equal ]]
+    [[ "$(compare_release_versions 1.2.2 1.2.3)" == older ]]
+    expect_failure "invalid version comparison" \
+        compare_release_versions 1.2.3-alpha 1.2.3
+
+    manifest_dir="$(mktemp -d)"
+    {
+        printf '  [package] # root package\n'
+        printf 'name = "cirrusync"\n'
+        printf 'version = "1.2.3" # release\n'
+        printf '\n[dependencies]\n'
+        printf 'version = "9.9.9"\n'
+    } >"${manifest_dir}/Cargo.toml"
+    [[ "$(read_package_version "${manifest_dir}/Cargo.toml")" == 1.2.3 ]] ||
+        fail "the package version reader selected the wrong TOML value"
+    {
+        printf '[package]\n'
+        printf 'name = "cirrusync"\n'
+        printf 'version = "1.2.3"\n'
+        printf 'version = "1.2.4"\n'
+    } >"${manifest_dir}/Cargo.toml"
+    expect_failure "duplicate package version" \
+        read_package_version "${manifest_dir}/Cargo.toml"
+    {
+        printf '[package]\n'
+        printf 'name = "cirrusync"\n'
+        printf 'description = """\n'
+        printf 'version = "1.2.3"\n'
+        printf '"""\n'
+    } >"${manifest_dir}/Cargo.toml"
+    expect_failure "version assignment inside a multiline string" \
+        read_package_version "${manifest_dir}/Cargo.toml"
+    rm -rf -- "${manifest_dir}"
+}
+
+test_upgrade_candidate_policy() (
+    local candidate_manifest="${BOOTSTRAP_TEST_ROOT}/candidate/Cargo.toml"
+    local invalid_version_output=""
+
+    mkdir -p -- "${candidate_manifest%/*}" "${BINARY_PATH%/*}"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"${BINARY_PATH}"
+    chmod 0755 "${BINARY_PATH}"
+    read_cirrusync_binary_version() {
+        printf '%s' 1.2.3
+    }
+    # The policy test must never signal real processes owned by the build user.
+    terminate_account_processes() {
+        :
+    }
+    managed_installation_is_complete() {
+        return 0
+    }
+
+    ACTION=update
+    FORCE_REINSTALL=false
+    INSTALLED_SOURCE_COMMIT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    CANDIDATE_SOURCE_COMMIT="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    # These globals are consumed dynamically by evaluate_upgrade_candidate.
+    # shellcheck disable=SC2034
+    STAGED_SOURCE="${candidate_manifest%/*}"
+
+    printf '[package]\nname = "cirrusync"\nversion = "\033[31muntrusted"\n' \
+        >"${candidate_manifest}"
+    if invalid_version_output="$(evaluate_upgrade_candidate 2>&1)"; then
+        fail "a malformed candidate version was accepted"
+    fi
+    [[ "${invalid_version_output}" != *$'\033'* &&
+        "${invalid_version_output}" != *untrusted* ]] ||
+        fail "a malformed candidate version was reflected into installer logs"
+
+    printf '[package]\nname = "cirrusync"\nversion = "1.3.0"\n' \
+        >"${candidate_manifest}"
+    evaluate_upgrade_candidate >/dev/null
+    [[ "${CANDIDATE_VERSION}" == 1.3.0 &&
+        "${INSTALLED_VERSION}" == 1.2.3 &&
+        "${UPGRADE_IS_NOOP}" == false ]] ||
+        fail "a newer candidate was not accepted as an upgrade"
+
+    printf '[package]\nname = "cirrusync"\nversion = "1.2.3"\n' \
+        >"${candidate_manifest}"
+    CANDIDATE_SOURCE_COMMIT="${INSTALLED_SOURCE_COMMIT}"
+    UPGRADE_IS_NOOP=false
+    evaluate_upgrade_candidate >/dev/null
+    [[ "${UPGRADE_IS_NOOP}" == true ]] ||
+        fail "the identical version and revision was not a no-op"
+
+    managed_installation_is_complete() {
+        return 1
+    }
+    INCOMPLETE_INSTALL=false
+    UPGRADE_IS_NOOP=false
+    evaluate_upgrade_candidate >/dev/null
+    [[ "${INCOMPLETE_INSTALL}" == true &&
+        "${UPGRADE_IS_NOOP}" == false ]] ||
+        fail "runtime drift discovered during inspection was not repaired"
+    managed_installation_is_complete() {
+        return 0
+    }
+
+    # shellcheck disable=SC2034
+    CANDIDATE_SOURCE_COMMIT="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    INCOMPLETE_INSTALL=true
+    UPGRADE_IS_NOOP=false
+    expect_failure "changed source without a version bump" \
+        evaluate_upgrade_candidate
+
+    INCOMPLETE_INSTALL=false
+    FORCE_REINSTALL=true
+    evaluate_upgrade_candidate >/dev/null
+    [[ "${UPGRADE_IS_NOOP}" == false ]] ||
+        fail "force reinstall incorrectly returned a no-op"
+
+    FORCE_REINSTALL=false
+    printf '[package]\nname = "cirrusync"\nversion = "1.2.2"\n' \
+        >"${candidate_manifest}"
+    expect_failure "candidate downgrade" evaluate_upgrade_candidate
+
+    rm -f -- "${BINARY_PATH}"
+    # Consumed dynamically by evaluate_upgrade_candidate.
+    # shellcheck disable=SC2034
+    INSTALLED_SOURCE_VERSION="2.0.0"
+    INCOMPLETE_INSTALL=true
+    UPGRADE_IS_NOOP=false
+    printf '[package]\nname = "cirrusync"\nversion = "1.9.9"\n' \
+        >"${candidate_manifest}"
+    expect_failure "missing-binary downgrade against managed source" \
+        evaluate_upgrade_candidate
+
+    printf '[package]\nname = "cirrusync"\nversion = "2.0.0"\n' \
+        >"${candidate_manifest}"
+    # Consumed dynamically by evaluate_upgrade_candidate.
+    # shellcheck disable=SC2034
+    CANDIDATE_SOURCE_COMMIT="${INSTALLED_SOURCE_COMMIT}"
+    evaluate_upgrade_candidate >/dev/null
+    [[ "${UPGRADE_IS_NOOP}" == false ]] ||
+        fail "an incomplete equal-version installation incorrectly returned a no-op"
+
+    printf '#!/usr/bin/env bash\nexit 0\n' >"${BINARY_PATH}"
+    chmod 0755 "${BINARY_PATH}"
+    read_cirrusync_binary_version() {
+        return 1
+    }
+    FORCE_REINSTALL=true
+    printf '[package]\nname = "cirrusync"\nversion = "1.9.9"\n' \
+        >"${candidate_manifest}"
+    expect_failure "unreadable-binary downgrade against managed source" \
+        evaluate_upgrade_candidate
+
+    rm -f -- "${BINARY_PATH}"
+    # Consumed dynamically by evaluate_upgrade_candidate.
+    # shellcheck disable=SC2034
+    INSTALLED_SOURCE_VERSION=""
+    FORCE_REINSTALL=false
+    expect_failure "incomplete installation without a version floor" \
+        evaluate_upgrade_candidate
+)
 
 test_account_id_input_handling() {
     (
@@ -117,6 +387,32 @@ test_account_id_configuration_generation() {
         write_configuration
 
         ! grep -Fq 'account_id' "${CONFIG_PATH}"
+
+        # These globals are consumed dynamically by write_configuration.
+        # shellcheck disable=SC2034
+        ACTION=update
+        # shellcheck disable=SC2034
+        INCOMPLETE_INSTALL=true
+        # shellcheck disable=SC2034
+        INPUT_ZONE=""
+        # shellcheck disable=SC2034
+        INPUT_RECORD=""
+        # shellcheck disable=SC2034
+        INPUT_IPV4=""
+        # shellcheck disable=SC2034
+        INPUT_IPV6=""
+        # shellcheck disable=SC2034
+        INPUT_INTERVAL=""
+        # shellcheck disable=SC2034
+        INPUT_CREATE=""
+        # shellcheck disable=SC2034
+        INPUT_PROXIED=""
+        write_token() {
+            printf 'replacement\n' >"${TOKEN_PATH}"
+        }
+        write_configuration
+        [[ -f "${TOKEN_PATH}" ]] ||
+            fail "incomplete upgrade did not restore a missing token"
     ) || fail "account- and user-token configuration generation was incorrect"
 }
 
@@ -1187,6 +1483,9 @@ test_repository_history_protection() {
 
 test_repository_validation
 test_argument_modes
+test_action_selection_and_override_detection
+test_release_version_helpers
+test_upgrade_candidate_policy
 test_account_id_input_handling
 test_account_id_configuration_generation
 test_rollback_failure_reporting

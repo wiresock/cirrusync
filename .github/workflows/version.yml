@@ -1,0 +1,207 @@
+name: Version Policy
+
+on:
+  # The workflow and checker must come from the trusted target branch. The
+  # proposed commit is fetched only as Git data and is never checked out or
+  # executed.
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - edited
+      - opened
+      - ready_for_review
+      - reopened
+      - synchronize
+
+permissions:
+  contents: read
+  # The trusted workflow publishes its result on the proposed commit so branch
+  # protection can require it. No pull-request code is executed with this
+  # permission.
+  statuses: write
+  pull-requests: read
+
+concurrency:
+  group: version-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Mark the proposed commit as pending
+        if: github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            --field state=pending \
+            --field context="cirrusync/version-policy" \
+            --field description="Version policy validation is running" \
+            --field target_url="$RUN_URL"
+
+      - name: Check out source and comparison history
+        id: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate version files
+        id: validate_base
+        run: python3 scripts/versioning.py validate
+
+      - name: Fetch proposed commit as data
+        id: fetch_proposal
+        if: github.event_name == 'pull_request_target'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git -c core.hooksPath=/dev/null \
+            -c protocol.file.allow=never \
+            fetch --no-tags --depth=1 origin \
+            "refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head"
+          test "$(git rev-parse "refs/remotes/pull/${PR_NUMBER}/head")" = \
+            "$EXPECTED_HEAD_SHA"
+
+          merge_ref="refs/remotes/pull/${PR_NUMBER}/merge"
+          merge_fetched=false
+          for attempt in 1 2 3; do
+            if git -c core.hooksPath=/dev/null \
+              -c protocol.file.allow=never \
+              fetch --no-tags --depth=1 origin \
+              "+refs/pull/${PR_NUMBER}/merge:${merge_ref}"; then
+              mapfile -t merge_parents < <(
+                git cat-file -p "$merge_ref" |
+                  awk 'NF == 0 { exit } $1 == "parent" && NF == 2 { print $2 }'
+              )
+              if [[ "${#merge_parents[@]}" -eq 2 &&
+                "${merge_parents[0]}" = "$BASE_SHA" &&
+                "${merge_parents[1]}" = "$EXPECTED_HEAD_SHA" ]]; then
+                merge_fetched=true
+                break
+              fi
+            fi
+            if ((attempt < 3)); then
+              sleep 2
+            fi
+          done
+
+          if [[ "$merge_fetched" == true ]]; then
+            merge_sha="$(git rev-parse "$merge_ref")"
+            echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          else
+            mergeable="$(
+              gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+                --jq .mergeable
+            )"
+            test "$mergeable" = false
+            echo "The pull request currently has merge conflicts."
+            echo "merge_sha=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mark the test-merge commit as pending
+        if: >-
+          github.event_name == 'pull_request_target' &&
+          steps.fetch_proposal.outputs.merge_sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.fetch_proposal.outputs.merge_sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${MERGE_SHA}" \
+            --field state=pending \
+            --field context="cirrusync/version-policy" \
+            --field description="Version policy validation is running" \
+            --field target_url="$RUN_URL"
+
+      - name: Require a version increase in pull requests
+        id: validate_proposal
+        if: github.event_name == 'pull_request_target'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: refs/remotes/pull/${{ github.event.pull_request.number }}/head
+        run: >-
+          python3 scripts/versioning.py check-pr
+          --base "$BASE_SHA"
+          --head "$HEAD_REF"
+
+      - name: Validate the test-merge version files
+        id: validate_merge
+        if: >-
+          github.event_name == 'pull_request_target' &&
+          steps.fetch_proposal.outputs.merge_sha != ''
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_REF: refs/remotes/pull/${{ github.event.pull_request.number }}/merge
+        run: >-
+          python3 scripts/versioning.py check-pr
+          --base "$BASE_SHA"
+          --head "$MERGE_REF"
+
+      - name: Confirm the pull request did not change during validation
+        id: confirm_proposal
+        if: github.event_name == 'pull_request_target'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.fetch_proposal.outputs.merge_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          current_refs="$(
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+              --jq '[.base.sha, .head.sha, (.merge_commit_sha // "")] | @tsv'
+          )"
+          IFS=$'\t' read -r current_base current_head current_merge \
+            <<< "$current_refs"
+          test "$current_base" = "$BASE_SHA"
+          test "$current_head" = "$EXPECTED_HEAD_SHA"
+          test "$current_merge" = "$MERGE_SHA"
+
+      - name: Publish the required version-policy status
+        if: always() && github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ steps.fetch_proposal.outputs.merge_sha }}
+          POLICY_JOB_STATUS: ${{ job.status }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ "$POLICY_JOB_STATUS" == success ]]; then
+            policy_state=success
+            description="Version increase and canonical files are valid"
+          else
+            policy_state=failure
+            description="Version policy validation failed"
+          fi
+
+          publish_status() {
+            local commit_sha=$1
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/statuses/${commit_sha}" \
+              --field state="$policy_state" \
+              --field context="cirrusync/version-policy" \
+              --field description="$description" \
+              --field target_url="$RUN_URL"
+          }
+
+          publish_failed=false
+          publish_status "$HEAD_SHA" || publish_failed=true
+          if [[ -n "$MERGE_SHA" ]]; then
+            publish_status "$MERGE_SHA" || publish_failed=true
+          fi
+          if [[ "$publish_failed" == true ]]; then
+            exit 1
+          fi

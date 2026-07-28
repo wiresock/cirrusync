@@ -4,5 +4,7 @@
 /.env
 *.swp
 *.tmp
+__pycache__/
+*.py[cod]
 .idea/
 .vscode/

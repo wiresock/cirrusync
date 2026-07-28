@@ -283,7 +283,7 @@ inherited by child processes, retained in automation configuration, or visible
 to sufficiently privileged process inspection. They are not printed by the
 installer.
 
-An ordinary non-interactive rerun selects update mode and preserves the
+An ordinary non-interactive rerun selects upgrade mode and preserves the
 existing configuration and token. To replace configuration from automation,
 use `--reconfigure --non-interactive` and provide at least
 `CIRRUSYNC_ZONE` and `CIRRUSYNC_RECORD`; other omitted values use their safe
@@ -300,7 +300,9 @@ Other installer options:
 --token-file /absolute/path/token-source
 --non-interactive
 --skip-tests
---update
+--upgrade
+--update              # compatibility alias for --upgrade
+--force-reinstall     # rebuild an equal version; requires --upgrade
 --reconfigure
 --uninstall
 --help
@@ -426,7 +428,15 @@ sudo chmod 0750 /etc/cirrusync
 
 ## Command-line use
 
-All commands accept the global configuration option:
+Print the installed software version without loading configuration or accessing
+the network:
+
+```console
+cirrusync --version
+```
+
+The reported value comes from the package version in `Cargo.toml`. All
+operational commands accept the global configuration option:
 
 ```console
 sudo -u cirrusync -- /usr/local/bin/cirrusync \
@@ -464,6 +474,8 @@ user.
   where `create_if_missing = true`; combine both flags when either state is
   possible.
 - `print-config` prints an example, never the active configuration or token.
+- `--version` prints the installed Cirrusync version and exits without reading
+  the active configuration or token.
 
 An edit probe is intended to preserve DNS resolution, but Cloudflare does not
 document a conditional-write precondition for this endpoint. A simultaneous
@@ -566,16 +578,41 @@ Download and review the new installer, then:
 ```console
 sudo bash bootstrap.sh \
   --branch main \
-  --update
+  --upgrade
 ```
 
-The managed checkout must be clean and have the requested origin. An update
-clones the selected branch to a separate staging tree, rebuilds and retests,
-activates and validates the new binary transactionally, and promotes the staged
-source only after the service stays healthy. It never regenerates or prints
-the token. If the installation uses a custom configuration filename, repeat
-the same `--config /etc/cirrusync/<name>.toml` option on every update,
-reconfiguration, unit reinstall, and uninstall.
+`--update` remains a compatibility alias for `--upgrade`. The installer
+compares the selected source version with `/usr/local/bin/cirrusync --version`
+before replacing the installed binary:
+
+- a newer source version is built, tested, activated, and validated
+  transactionally;
+- an equal version from the same managed commit is reported as already current
+  and exits without replacing Cirrusync files, refreshing Rust, or restarting
+  the service;
+- an equal version repairs missing managed artifacts, while a different source
+  commit with no version bump is rejected unless `--force-reinstall` is used;
+- an older source version is rejected as a downgrade, leaving the installation
+  unchanged.
+
+Use `--upgrade --force-reinstall` only when an equal-version installation
+needs to be rebuilt for recovery; it does not permit a downgrade.
+An equal-version no-op is used only when the runtime files, permissions,
+service identity, systemd configuration, and active service state are already
+healthy. If both the installed binary and managed source are missing while
+other installation artifacts remain, the installer refuses to guess a
+downgrade-safe recovery version.
+
+The managed checkout must be clean and have the requested origin. An upgrade
+clones the selected branch to a separate staging tree, rebuilds and retests
+when a newer version is available, activates and validates the new binary
+transactionally, and promotes the staged source only after the service stays
+healthy. It never regenerates or prints the token. If the installation uses a
+custom configuration filename, repeat the same
+`--config /etc/cirrusync/<name>.toml` option on every upgrade,
+reconfiguration, unit reinstall, and uninstall. The complete version policy,
+including the accepted version format and pull-request requirements, is in
+[`docs/VERSIONING.md`](docs/VERSIONING.md).
 
 For an automated configuration change:
 
@@ -586,7 +623,7 @@ sudo CIRRUSYNC_ZONE=example.com \
   bash bootstrap.sh --reconfigure --non-interactive
 ```
 
-Interactive reruns offer binary update, reconfiguration, unit reinstall, and
+Interactive reruns offer binary upgrade, reconfiguration, unit reinstall, and
 uninstall. To uninstall directly:
 
 ```console
@@ -670,13 +707,17 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Development and releases
 
-Normal tests use HTTP mocks and require no live Cloudflare credential:
+Development requires Rust 1.85 or newer, Python 3.11 or newer, Git, and
+ShellCheck. On Windows, use `py -3.11` in place of `python3` in the commands
+below. Normal tests use HTTP mocks and require no live Cloudflare credential:
 
 ```console
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
 cargo build --release --locked
+python3 scripts/versioning.py validate
+python3 -m unittest tests/test_versioning.py -v
 shellcheck --severity=warning \
   bootstrap.sh \
   tests/bootstrap_static.sh \
@@ -705,8 +746,10 @@ and attach the binaries/checksums to the GitHub release. Add a release workflow
 only after reproducible cross-architecture builds and signing policy are
 settled.
 
-Contribution guidance is in [CONTRIBUTING.md](CONTRIBUTING.md), and notable
-changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+Contribution guidance is in [CONTRIBUTING.md](CONTRIBUTING.md), the release and
+pull-request version policy is in
+[`docs/VERSIONING.md`](docs/VERSIONING.md), and notable changes are tracked in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

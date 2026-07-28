@@ -55,6 +55,7 @@ TOKEN_INPUT_FILE=""
 NON_INTERACTIVE=false
 SKIP_TESTS=false
 UPDATE_REQUESTED=false
+FORCE_REINSTALL=false
 RECONFIGURE_REQUESTED=false
 UNINSTALL_REQUESTED=false
 ACTION="install"
@@ -91,6 +92,12 @@ STATE_DIR_METADATA=""
 UNIT_OVERRIDE_DIR_HAD_EXISTING=false
 UNIT_OVERRIDE_DIR_METADATA=""
 INCOMPLETE_INSTALL=false
+INSTALLED_VERSION=""
+INSTALLED_SOURCE_VERSION=""
+CANDIDATE_VERSION=""
+INSTALLED_SOURCE_COMMIT=""
+CANDIDATE_SOURCE_COMMIT=""
+UPGRADE_IS_NOOP=false
 
 INPUT_TOKEN_FILE=""
 INPUT_TOKEN_VALUE=""
@@ -582,8 +589,11 @@ Options:
   --non-interactive   Do not prompt. Required values must be supplied through
                       options or environment variables.
   --skip-tests        Build without running cargo test --locked.
-  --update            Update the managed source and binary without replacing
+  --upgrade           Upgrade the managed source and binary without replacing
                       an existing configuration or token.
+  --update            Compatibility alias for --upgrade.
+  --force-reinstall   Rebuild an equal-version installation instead of
+                      returning "already current"; requires --upgrade.
   --reconfigure       Replace configuration non-interactively or select
                       reconfiguration directly; explicit values are required.
   --uninstall         Remove the service, unit, and binary. Configuration and
@@ -605,7 +615,7 @@ Non-interactive environment:
   CIRRUSYNC_PROXIED     Enable Cloudflare proxying (default: false).
 
 The equivalent CFDDNS_* names are accepted as compatibility aliases. Existing
-configuration and token files are preserved in non-interactive update mode.
+configuration and token files are preserved in non-interactive upgrade mode.
 After an incomplete installation, explicitly supplied values replace the
 corresponding incomplete files.
 EOF
@@ -642,8 +652,12 @@ parse_arguments() {
                 SKIP_TESTS=true
                 shift
                 ;;
-            --update)
+            --upgrade | --update)
                 UPDATE_REQUESTED=true
+                shift
+                ;;
+            --force-reinstall)
+                FORCE_REINSTALL=true
                 shift
                 ;;
             --reconfigure)
@@ -674,7 +688,11 @@ parse_arguments() {
     if [[ "${UPDATE_REQUESTED}" == true && "${RECONFIGURE_REQUESTED}" == true ]] ||
         [[ "${UPDATE_REQUESTED}" == true && "${UNINSTALL_REQUESTED}" == true ]] ||
         [[ "${RECONFIGURE_REQUESTED}" == true && "${UNINSTALL_REQUESTED}" == true ]]; then
-        die "--update, --reconfigure, and --uninstall are mutually exclusive"
+        die "--upgrade/--update, --reconfigure, and --uninstall are mutually exclusive"
+    fi
+    if [[ "${FORCE_REINSTALL}" == true &&
+        "${UPDATE_REQUESTED}" != true ]]; then
+        die "--force-reinstall requires --upgrade (or its --update compatibility alias)"
     fi
 }
 
@@ -1284,6 +1302,16 @@ require_running_systemd() {
         die "systemd is not running; Cirrusync cannot be installed safely"
 }
 
+basic_installation_artifacts_are_present() {
+    [[ -x "${BINARY_PATH}" && -f "${UNIT_PATH}" &&
+        -f "${CONFIG_PATH}" && -f "${TOKEN_PATH}" ]] || return 1
+    if [[ "${CONFIG_PATH}" == "${DEFAULT_CONFIG_PATH}" ]]; then
+        [[ ! -e "${UNIT_OVERRIDE_PATH}" && ! -L "${UNIT_OVERRIDE_PATH}" ]]
+    else
+        [[ -f "${UNIT_OVERRIDE_PATH}" && ! -L "${UNIT_OVERRIDE_PATH}" ]]
+    fi
+}
+
 choose_action() {
     if [[ "${UNINSTALL_REQUESTED}" == true ]]; then
         ACTION="uninstall"
@@ -1295,6 +1323,10 @@ choose_action() {
     fi
     if [[ "${UPDATE_REQUESTED}" == true ]]; then
         ACTION="update"
+        if ! basic_installation_artifacts_are_present; then
+            INCOMPLETE_INSTALL=true
+            log "Incomplete installation detected; repairing it during the upgrade"
+        fi
         return
     fi
 
@@ -1304,14 +1336,13 @@ choose_action() {
     fi
 
     if [[ "${NON_INTERACTIVE}" == true ]]; then
-        if [[ ! -x "${BINARY_PATH}" || ! -f "${UNIT_PATH}" ||
-            ! -f "${CONFIG_PATH}" || ! -f "${TOKEN_PATH}" ]]; then
+        if ! basic_installation_artifacts_are_present; then
             ACTION="install"
             INCOMPLETE_INSTALL=true
             log "Incomplete installation detected; rebuilding it transactionally"
         else
             ACTION="update"
-            log "Existing installation detected; updating while preserving configuration and token"
+            log "Existing installation detected; upgrading while preserving configuration and token"
         fi
         return
     fi
@@ -1319,7 +1350,7 @@ choose_action() {
     cat <<'EOF'
 
 An existing Cirrusync installation was detected.
-  1) Update binary and reinstall unit; keep configuration and token
+  1) Upgrade binary and reinstall unit; keep configuration and token
   2) Reconfigure; keep the installed binary
   3) Reinstall the systemd unit only
   4) Uninstall
@@ -1328,12 +1359,278 @@ EOF
     local selection=""
     read_from_tty -p "Select an action [1]: " selection
     case "${selection:-1}" in
-        1) ACTION="update" ;;
+        1)
+            ACTION="update"
+            if ! basic_installation_artifacts_are_present; then
+                INCOMPLETE_INSTALL=true
+                log "Incomplete installation detected; repairing it during the upgrade"
+            fi
+            ;;
         2) ACTION="reconfigure" ;;
         3) ACTION="unit" ;;
         4) ACTION="uninstall" ;;
         5) ACTION="exit" ;;
         *) die "invalid selection" ;;
+    esac
+}
+
+release_version_is_valid() {
+    local version="${1:-}"
+    local major=""
+    local minor=""
+    local patch=""
+    local component=""
+
+    [[ "${version}" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]] ||
+        return 1
+    IFS=. read -r major minor patch <<<"${version}"
+    for component in "${major}" "${minor}" "${patch}"; do
+        ((10#${component} <= 999999999)) || return 1
+    done
+}
+
+compare_release_versions() {
+    local candidate="$1"
+    local installed="$2"
+    local candidate_major=""
+    local candidate_minor=""
+    local candidate_patch=""
+    local installed_major=""
+    local installed_minor=""
+    local installed_patch=""
+    local candidate_component=""
+    local installed_component=""
+    local index=""
+    local -a candidate_components=()
+    local -a installed_components=()
+
+    release_version_is_valid "${candidate}" &&
+        release_version_is_valid "${installed}" || return 2
+    IFS=. read -r candidate_major candidate_minor candidate_patch \
+        <<<"${candidate}"
+    IFS=. read -r installed_major installed_minor installed_patch \
+        <<<"${installed}"
+    candidate_components=(
+        "${candidate_major}" "${candidate_minor}" "${candidate_patch}"
+    )
+    installed_components=(
+        "${installed_major}" "${installed_minor}" "${installed_patch}"
+    )
+    for index in 0 1 2; do
+        candidate_component="${candidate_components[${index}]}"
+        installed_component="${installed_components[${index}]}"
+        if ((10#${candidate_component} > 10#${installed_component})); then
+            printf '%s' newer
+            return
+        fi
+        if ((10#${candidate_component} < 10#${installed_component})); then
+            printf '%s' older
+            return
+        fi
+    done
+    printf '%s' equal
+}
+
+read_package_version() {
+    local manifest="$1"
+    local manifest_size=""
+
+    [[ -f "${manifest}" && ! -L "${manifest}" ]] || return 1
+    manifest_size="$(stat -c '%s' "${manifest}")" || return 1
+    [[ "${manifest_size}" =~ ^[0-9]+$ ]] || return 1
+    ((manifest_size <= 1048576)) || return 1
+    # The privileged installer uses a deliberately narrow line parser. Reject
+    # multiline strings so their contents cannot masquerade as package fields.
+    if LC_ALL=C grep -Fq '"""' "${manifest}" ||
+        LC_ALL=C grep -Fq "'''" "${manifest}"; then
+        return 1
+    fi
+    awk '
+        /^[[:space:]]*\[package\][[:space:]]*(#.*)?$/ {
+            in_package = 1
+            next
+        }
+        /^[[:space:]]*\[/ {
+            in_package = 0
+        }
+        in_package && /^[[:space:]]*version[[:space:]]*=/ {
+            version_count++
+            value = $0
+            sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*/, "", value)
+            sub(/[[:space:]]*(#.*)?$/, "", value)
+            if (value !~ /^"[^"]*"$/) {
+                invalid = 1
+                next
+            }
+            sub(/^"/, "", value)
+            sub(/"$/, "", value)
+        }
+        in_package && /^[[:space:]]*name[[:space:]]*=/ {
+            name_count++
+            package_name = $0
+            sub(/^[[:space:]]*name[[:space:]]*=[[:space:]]*/, "", package_name)
+            sub(/[[:space:]]*(#.*)?$/, "", package_name)
+            if (package_name !~ /^"[^"]*"$/) {
+                invalid = 1
+                next
+            }
+            sub(/^"/, "", package_name)
+            sub(/"$/, "", package_name)
+        }
+        END {
+            if (name_count != 1 || package_name != "cirrusync" ||
+                version_count != 1 || invalid || value == "") {
+                exit 1
+            }
+            print value
+        }
+    ' "${manifest}"
+}
+
+read_cirrusync_binary_version() (
+    local executable="$1"
+    local output_file=""
+    local output_size=""
+    local output=""
+    local status=""
+    local version=""
+
+    trap '[[ -z "${output_file}" ]] || rm -f -- "${output_file}"' EXIT
+    trap 'exit 1' HUP INT TERM
+    [[ -f "${executable}" && ! -L "${executable}" &&
+        -x "${executable}" ]] || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    command -v prlimit >/dev/null 2>&1 || return 1
+    output_file="$(mktemp /var/tmp/cirrusync-version.XXXXXX)" || return 1
+    chmod 0600 "${output_file}" || {
+        rm -f -- "${output_file}"
+        return 1
+    }
+    if run_without_privilege_gain "${BUILD_USER}" \
+        timeout --signal=TERM --kill-after=2s 5s \
+        prlimit --fsize=128:128 -- \
+        env -i \
+        "HOME=/nonexistent" \
+        "PATH=/usr/local/bin:/usr/bin:/bin" \
+        "${executable}" --version >"${output_file}" 2>/dev/null; then
+        status=0
+    else
+        status="$?"
+    fi
+    terminate_account_processes "${BUILD_USER}" || status=1
+    if ((status != 0)); then
+        rm -f -- "${output_file}"
+        return 1
+    fi
+    output_size="$(stat -c '%s' "${output_file}")" || {
+        rm -f -- "${output_file}"
+        return 1
+    }
+    output="$(<"${output_file}")"
+    rm -f -- "${output_file}"
+    [[ "${output_size}" =~ ^[0-9]+$ &&
+        "${output_size}" -eq $((${#output} + 1)) ]] || return 1
+    [[ "${output}" == "cirrusync "* && "${output}" != *$'\n'* ]] || return 1
+    version="${output#cirrusync }"
+    release_version_is_valid "${version}" || return 1
+    printf '%s' "${version}"
+)
+
+evaluate_upgrade_candidate() {
+    local binary_version=""
+    local comparison_version=""
+    local relation=""
+    local repair_required=false
+
+    CANDIDATE_VERSION="$(read_package_version \
+        "${STAGED_SOURCE}/Cargo.toml")" ||
+        die "could not read the staged Cirrusync package version"
+    release_version_is_valid "${CANDIDATE_VERSION}" ||
+        die "the staged package version is not a supported MAJOR.MINOR.PATCH release"
+    log "Candidate Cirrusync version: ${CANDIDATE_VERSION}"
+
+    if [[ -n "${INSTALLED_SOURCE_VERSION}" ]]; then
+        log "Managed-source Cirrusync version: ${INSTALLED_SOURCE_VERSION}"
+        comparison_version="${INSTALLED_SOURCE_VERSION}"
+    fi
+
+    if [[ -e "${BINARY_PATH}" ]]; then
+        if ! binary_version="$(read_cirrusync_binary_version \
+            "${BINARY_PATH}")"; then
+            terminate_account_processes "${BUILD_USER}" ||
+                die "installed version inspection left processes that could not be terminated"
+            [[ "${FORCE_REINSTALL}" == true ]] ||
+                die "could not determine the installed version; rerun with --upgrade --force-reinstall to repair it"
+            [[ -n "${INSTALLED_SOURCE_VERSION}" ]] ||
+                die "cannot establish a downgrade-safe recovery version because both the installed binary and managed source are unreadable or missing"
+            warn "Could not determine the installed binary version; using the managed source as the recovery floor"
+            repair_required=true
+        else
+            terminate_account_processes "${BUILD_USER}" ||
+                die "installed version inspection left processes that could not be terminated"
+            log "Installed binary Cirrusync version: ${binary_version}"
+            if [[ -z "${comparison_version}" ]]; then
+                comparison_version="${binary_version}"
+            else
+                relation="$(compare_release_versions \
+                    "${binary_version}" "${comparison_version}")" ||
+                    die "could not compare installed binary and managed-source versions"
+                if [[ "${relation}" == newer ]]; then
+                    comparison_version="${binary_version}"
+                fi
+                if [[ "${binary_version}" != "${INSTALLED_SOURCE_VERSION}" ]]; then
+                    warn "Installed binary and managed source report different versions; the higher version is the downgrade floor"
+                    repair_required=true
+                fi
+            fi
+        fi
+    else
+        log "No installed binary was found"
+        repair_required=true
+    fi
+
+    if [[ -z "${comparison_version}" ]]; then
+        [[ "${INCOMPLETE_INSTALL}" != true ]] ||
+            die "cannot establish a downgrade-safe recovery version because the prior installation has neither a readable binary nor managed source"
+        log "Installing Cirrusync ${CANDIDATE_VERSION} without an existing version floor"
+        return
+    fi
+    INSTALLED_VERSION="${comparison_version}"
+    relation="$(compare_release_versions \
+        "${CANDIDATE_VERSION}" "${INSTALLED_VERSION}")" ||
+        die "could not compare installed and candidate versions"
+    case "${relation}" in
+        newer)
+            log "Upgrading Cirrusync ${INSTALLED_VERSION} -> ${CANDIDATE_VERSION}"
+            ;;
+        equal)
+            if [[ "${FORCE_REINSTALL}" == true ]]; then
+                log "Force-reinstalling Cirrusync ${INSTALLED_VERSION}"
+            elif [[ -n "${INSTALLED_SOURCE_COMMIT}" &&
+                "${CANDIDATE_SOURCE_COMMIT}" != \
+                "${INSTALLED_SOURCE_COMMIT}" ]]; then
+                die "candidate source changed without a version bump; use a newer release or --force-reinstall"
+            elif [[ "${INCOMPLETE_INSTALL}" == true ||
+                "${repair_required}" == true ]]; then
+                log "Repairing the incomplete Cirrusync ${INSTALLED_VERSION} installation"
+            elif [[ "${ACTION}" == update ]] &&
+                ! managed_installation_is_complete; then
+                INCOMPLETE_INSTALL=true
+                log "Installed runtime state changed during upgrade inspection"
+                log "Repairing the incomplete Cirrusync ${INSTALLED_VERSION} installation"
+            elif [[ -z "${INSTALLED_SOURCE_COMMIT}" ]]; then
+                log "Reinstalling Cirrusync ${INSTALLED_VERSION} because the managed source is missing"
+            else
+                UPGRADE_IS_NOOP=true
+                log "Cirrusync ${INSTALLED_VERSION} is already current"
+            fi
+            ;;
+        older)
+            die "refusing to downgrade Cirrusync ${INSTALLED_VERSION} to ${CANDIDATE_VERSION}"
+            ;;
+        *)
+            die "internal error: unsupported version comparison result"
+            ;;
     esac
 }
 
@@ -1350,6 +1647,17 @@ install_dependencies() {
         pkg-config \
         procps \
         util-linux
+}
+
+upgrade_inspection_dependencies_are_available() {
+    local command_name=""
+
+    for command_name in \
+        awk chmod chown cut find getent getfacl git id install mktemp pgrep \
+        pkill prlimit readlink runuser setpriv sha256sum stat systemctl \
+        timeout; do
+        command -v "${command_name}" >/dev/null 2>&1 || return 1
+    done
 }
 
 rust_version_is_sufficient() {
@@ -1692,14 +2000,37 @@ sync_source() {
     [[ -f "${STAGED_SOURCE}/Cargo.lock" &&
         -f "${STAGED_SOURCE}/systemd/cirrusync.service" ]] ||
         die "the staged source is missing required project files"
+    CANDIDATE_SOURCE_COMMIT="$(run_without_privilege_gain "${BUILD_USER}" \
+        env -i "${git_environment[@]}" \
+        "GIT_CONFIG_GLOBAL=/dev/null" \
+        git -c core.hooksPath=/dev/null \
+        -C "${STAGED_SOURCE}" rev-parse --verify HEAD)" ||
+        die "could not identify the staged source revision"
+    [[ "${CANDIDATE_SOURCE_COMMIT}" =~ ^[0-9a-f]{40,64}$ ]] ||
+        die "the staged source returned an invalid commit identifier"
     if [[ -e "${SOURCE_DIR}" ]]; then
         verify_existing_repository_is_recoverable \
             "${SOURCE_DIR}" "${STAGED_SOURCE}" "${source_home}"
+        INSTALLED_SOURCE_COMMIT="$(run_without_privilege_gain "${BUILD_USER}" \
+            env -i "${git_environment[@]}" \
+            "GIT_CONFIG_GLOBAL=${GIT_SAFE_CONFIG}" \
+            git -c core.hooksPath=/dev/null \
+            -C "${SOURCE_DIR}" rev-parse --verify HEAD)" ||
+            die "could not identify the installed source revision"
+        [[ "${INSTALLED_SOURCE_COMMIT}" =~ ^[0-9a-f]{40,64}$ ]] ||
+            die "the installed source returned an invalid commit identifier"
+        INSTALLED_SOURCE_VERSION="$(read_package_version \
+            "${SOURCE_DIR}/Cargo.toml")" ||
+            die "could not read the installed managed-source package version"
+        release_version_is_valid "${INSTALLED_SOURCE_VERSION}" ||
+            die "the installed managed-source version is not a supported MAJOR.MINOR.PATCH release"
         terminate_account_processes "${BUILD_USER}" ||
             die "repository history inspection left processes that could not be terminated"
         rm -f -- "${GIT_SAFE_CONFIG}"
         GIT_SAFE_CONFIG=""
     fi
+    terminate_account_processes "${BUILD_USER}" ||
+        die "source synchronization left processes that could not be terminated"
 }
 
 build_project() {
@@ -1710,6 +2041,7 @@ build_project() {
     local ignored_output=""
     local index_flag_output=""
     local unexpected_entry=""
+    local built_version=""
     local -a cargo_environment=()
 
     create_build_account
@@ -1755,6 +2087,17 @@ build_project() {
     [[ -f "${target_dir}/release/cirrusync" &&
         ! -L "${target_dir}/release/cirrusync" ]] ||
         die "the release build did not produce ${target_dir}/release/cirrusync"
+    built_version="$(read_cirrusync_binary_version \
+        "${target_dir}/release/cirrusync")" || {
+        terminate_account_processes "${BUILD_USER}" ||
+            warn "failed release version inspection left processes that could not be terminated"
+        die "the release binary did not report a valid Cirrusync version"
+    }
+    terminate_account_processes "${BUILD_USER}" ||
+        die "release version inspection left processes that could not be terminated"
+    [[ "${built_version}" == "${CANDIDATE_VERSION}" ]] ||
+        die "the release binary version ${built_version} does not match the staged package version ${CANDIDATE_VERSION}"
+    log "Verified release binary version ${built_version}"
     [[ -d "${STAGED_SOURCE}" && ! -L "${STAGED_SOURCE}" &&
         "$(readlink -f -- "${STAGED_SOURCE}")" == "${STAGED_SOURCE}" ]] ||
         die "the build replaced its staged source root with an unsafe path"
@@ -1815,6 +2158,8 @@ build_project() {
     STAGED_BINARY="$(mktemp "/usr/local/bin/.cirrusync.XXXXXX")"
     install -o root -g root -m 0755 \
         "${target_dir}/release/cirrusync" "${STAGED_BINARY}"
+    cmp --silent -- "${target_dir}/release/cirrusync" "${STAGED_BINARY}" ||
+        die "the staged binary does not match the verified release binary"
 }
 
 validate_local_system_group() {
@@ -1991,24 +2336,136 @@ create_service_account() {
 }
 
 validate_configuration_directory_acl() {
-    local directory_acl=""
+    [[ -d "${CONFIG_DIR}" ]] || return 0
+    access_acl_is_base_only "${CONFIG_DIR}" ||
+        die "${CONFIG_DIR} has an extended or default ACL; remove it before installing secrets"
+}
+
+access_acl_is_base_only() {
+    local path="$1"
+    local access_acl=""
     local acl_line=""
 
-    [[ -d "${CONFIG_DIR}" ]] || return 0
+    [[ -e "${path}" && ! -L "${path}" ]] || return 1
     command -v getfacl >/dev/null 2>&1 ||
-        die "getfacl is required to verify configuration directory access controls"
-    directory_acl="$(getfacl --absolute-names --numeric --omit-header \
-        "${CONFIG_DIR}" 2>/dev/null)" ||
-        die "could not inspect access controls on ${CONFIG_DIR}"
+        return 1
+    access_acl="$(getfacl --absolute-names --numeric --omit-header \
+        "${path}" 2>/dev/null)" || return 1
     while IFS= read -r acl_line; do
         case "${acl_line}" in
             "" | user::[r-][w-][x-] | group::[r-][w-][x-] | other::[r-][w-][x-]) ;;
-            *)
-                die "${CONFIG_DIR} has an extended or default ACL; remove it before installing secrets"
-                ;;
+            *) return 1 ;;
         esac
-    done <<<"${directory_acl}"
+    done <<<"${access_acl}"
     return 0
+}
+
+unit_override_matches_configuration() {
+    if [[ "${CONFIG_PATH}" == "${DEFAULT_CONFIG_PATH}" ]]; then
+        [[ ! -e "${UNIT_OVERRIDE_PATH}" && ! -L "${UNIT_OVERRIDE_PATH}" ]]
+        return
+    fi
+
+    [[ -d "${UNIT_OVERRIDE_DIR}" && ! -L "${UNIT_OVERRIDE_DIR}" &&
+        -f "${UNIT_OVERRIDE_PATH}" && ! -L "${UNIT_OVERRIDE_PATH}" ]] ||
+        return 1
+    [[ "$(stat -c '%u:%g:%a' "${UNIT_OVERRIDE_DIR}")" == "0:0:755" ]] ||
+        return 1
+    [[ "$(stat -c '%u:%g:%a:%h' "${UNIT_OVERRIDE_PATH}")" == "0:0:644:1" ]] ||
+        return 1
+    unit_override_has_expected_content
+}
+
+unit_override_has_expected_content() {
+    local actual=""
+    local actual_size=""
+    local expected=""
+
+    [[ "${CONFIG_PATH}" != "${DEFAULT_CONFIG_PATH}" &&
+        -f "${UNIT_OVERRIDE_PATH}" && ! -L "${UNIT_OVERRIDE_PATH}" ]] ||
+        return 1
+
+    expected="$(
+        printf '[Service]\n'
+        printf 'ExecStart=\n'
+        printf 'ExecStart=%s --config %s run\n' \
+            "${BINARY_PATH}" "${CONFIG_PATH}"
+        printf 'ReadOnlyPaths=%s\n' "${CONFIG_DIR}"
+    )"
+    actual_size="$(stat -c '%s' "${UNIT_OVERRIDE_PATH}")" || return 1
+    [[ "${actual_size}" =~ ^[0-9]+$ ]] || return 1
+    actual="$(<"${UNIT_OVERRIDE_PATH}")" || return 1
+    [[ "${actual}" == "${expected}" &&
+        "${actual_size}" -eq $((${#expected} + 1)) ]]
+}
+
+managed_installation_is_complete() (
+    local drop_in_paths=""
+    local fragment_path=""
+    local path=""
+    local service_gid=""
+    local service_uid=""
+
+    basic_installation_artifacts_are_present || return 1
+    validate_local_system_group "${SERVICE_GROUP}" >/dev/null 2>&1 || return 1
+    validate_local_system_user \
+        "${SERVICE_USER}" "${SERVICE_GROUP}" "${STATE_DIR}" \
+        >/dev/null 2>&1 || return 1
+    service_uid="$(id -u "${SERVICE_USER}")" || return 1
+    service_gid="$(getent group "${SERVICE_GROUP}" | cut -d: -f3)" || return 1
+
+    [[ "$(stat -c '%u:%g:%a:%h' "${BINARY_PATH}")" == "0:0:755:1" ]] ||
+        return 1
+    [[ "$(stat -c '%u:%g:%a:%h' "${UNIT_PATH}")" == "0:0:644:1" ]] ||
+        return 1
+    [[ "$(sha256sum "${UNIT_PATH}" | awk '{print $1}')" == \
+        "${SYSTEMD_UNIT_SHA256}" ]] || return 1
+    unit_override_matches_configuration || return 1
+
+    [[ -d "${CONFIG_DIR}" && ! -L "${CONFIG_DIR}" &&
+        "$(stat -c '%u:%g:%a' "${CONFIG_DIR}")" == \
+            "0:${service_gid}:750" ]] || return 1
+    access_acl_is_base_only "${CONFIG_DIR}" || return 1
+    for path in "${CONFIG_PATH}" "${TOKEN_PATH}"; do
+        [[ -f "${path}" && ! -L "${path}" &&
+            "$(stat -c '%u:%g:%a:%h' "${path}")" == \
+                "0:${service_gid}:640:1" ]] || return 1
+        access_acl_is_base_only "${path}" || return 1
+    done
+
+    [[ -d "${STATE_DIR}" && ! -L "${STATE_DIR}" &&
+        "$(stat -c '%u:%g:%a' "${STATE_DIR}")" == \
+            "${service_uid}:${service_gid}:750" ]] || return 1
+
+    [[ "$(systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null || true)" == \
+        enabled ]] || return 1
+    [[ "$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)" == \
+        active ]] || return 1
+    [[ "$(systemctl show --property=SubState --value \
+        "${SERVICE_NAME}" 2>/dev/null)" == running ]] || return 1
+    [[ "$(systemctl show --property=ExecMainStatus --value \
+        "${SERVICE_NAME}" 2>/dev/null)" == 0 ]] || return 1
+    [[ "$(systemctl show --property=NeedDaemonReload --value \
+        "${SERVICE_NAME}" 2>/dev/null)" == no ]] || return 1
+    fragment_path="$(systemctl show --property=FragmentPath --value \
+        "${SERVICE_NAME}" 2>/dev/null)" || return 1
+    [[ "${fragment_path}" == "${UNIT_PATH}" ]] || return 1
+    drop_in_paths="$(systemctl show --property=DropInPaths --value \
+        "${SERVICE_NAME}" 2>/dev/null)" || return 1
+    if [[ "${CONFIG_PATH}" == "${DEFAULT_CONFIG_PATH}" ]]; then
+        [[ " ${drop_in_paths} " != *" ${UNIT_OVERRIDE_PATH} "* ]]
+    else
+        [[ " ${drop_in_paths} " == *" ${UNIT_OVERRIDE_PATH} "* ]]
+    fi
+)
+
+mark_incomplete_installation_if_needed() {
+    [[ "${ACTION}" == update ]] || return 0
+    managed_installation_is_complete && return 0
+    if [[ "${INCOMPLETE_INSTALL}" != true ]]; then
+        log "Installed runtime state needs repair; rebuilding the current release"
+    fi
+    INCOMPLETE_INSTALL=true
 }
 
 secure_existing_configuration_files() {
@@ -2263,7 +2720,8 @@ write_configuration() {
                 chown root:"${SERVICE_GROUP}" "${CONFIG_PATH}"
                 chmod 0640 "${CONFIG_PATH}"
                 if [[ "${INCOMPLETE_INSTALL}" == true &&
-                    ( -n "${TOKEN_INPUT_FILE}" || -n "${INPUT_TOKEN_FILE}" ||
+                    ( ! -f "${TOKEN_PATH}" ||
+                        -n "${TOKEN_INPUT_FILE}" || -n "${INPUT_TOKEN_FILE}" ||
                         -n "${INPUT_TOKEN_VALUE}" ) ]]; then
                     write_token
                 fi
@@ -2681,12 +3139,25 @@ uninstall() {
     log "Uninstallation complete"
 }
 
+print_upgrade_noop() {
+    cat <<EOF
+
+Cirrusync ${INSTALLED_VERSION} is already current. No Cirrusync files were
+replaced, and the service's active/enabled state was not changed.
+
+Useful commands:
+  ${BINARY_PATH} --version
+  systemctl status ${SERVICE_NAME}
+EOF
+}
+
 print_follow_up() {
     cat <<EOF
 
 Cirrusync is installed and ${SERVICE_NAME} is active.
 
 Useful commands:
+  ${BINARY_PATH} --version
   systemctl status ${SERVICE_NAME}
   journalctl -u ${SERVICE_NAME} -f
 
@@ -2695,8 +3166,8 @@ Full permission check (the service owns the same resource locks):
   sudo -u ${SERVICE_USER} -- ${BINARY_PATH} --config ${CONFIG_PATH} check --allow-edit-probe --allow-create
   sudo systemctl start ${SERVICE_NAME}
 
-Update:
-  sudo ./bootstrap.sh --repo '${REPO_URL}' --branch '${BRANCH}' --config '${CONFIG_PATH}' --update
+Upgrade:
+  sudo ./bootstrap.sh --repo '${REPO_URL}' --branch '${BRANCH}' --config '${CONFIG_PATH}' --upgrade
 
 Uninstall (configuration and secrets are kept by default):
   sudo ./bootstrap.sh --config '${CONFIG_PATH}' --uninstall
@@ -2704,6 +3175,8 @@ EOF
 }
 
 main() {
+    local dependencies_installed=false
+
     parse_arguments "$@"
     ensure_root "$@"
     capture_install_environment
@@ -2712,13 +3185,14 @@ main() {
     choose_action
 
     if [[ "${ACTION}" == update &&
+        "${INCOMPLETE_INSTALL}" != true &&
         ( -n "${TOKEN_INPUT_FILE}" || -n "${INPUT_TOKEN_FILE}" ||
             -n "${INPUT_TOKEN_VALUE}" || -n "${INPUT_ZONE}" ||
             -n "${INPUT_ACCOUNT_ID}" || -n "${INPUT_RECORD}" ||
             -n "${INPUT_IPV4}" ||
             -n "${INPUT_IPV6}" || -n "${INPUT_INTERVAL}" ||
             -n "${INPUT_CREATE}" || -n "${INPUT_PROXIED}" ) ]]; then
-        die "configuration inputs are not applied during update; use --reconfigure"
+        die "configuration inputs are not applied during upgrade; use --reconfigure"
     fi
 
     case "${ACTION}" in
@@ -2737,12 +3211,29 @@ main() {
 
     case "${ACTION}" in
         install | update)
-            install_dependencies
+            if [[ "${ACTION}" == install ]]; then
+                install_dependencies
+                dependencies_installed=true
+            elif ! upgrade_inspection_dependencies_are_available; then
+                log "Restoring prerequisites required to inspect the candidate upgrade"
+                install_dependencies
+                dependencies_installed=true
+            fi
             validate_configuration_directory_acl
             create_build_account
             validate_existing_token_before_build
-            ensure_rust
             sync_source
+            mark_incomplete_installation_if_needed
+            evaluate_upgrade_candidate
+            if [[ "${UPGRADE_IS_NOOP}" == true ]]; then
+                print_upgrade_noop
+                return
+            fi
+            if [[ "${ACTION}" == update &&
+                "${dependencies_installed}" != true ]]; then
+                install_dependencies
+            fi
+            ensure_rust
             build_project
             begin_transaction
             create_service_account
@@ -2759,7 +3250,7 @@ main() {
             [[ -x "${BINARY_PATH}" ]] ||
                 die "cannot reconfigure because ${BINARY_PATH} is missing"
             [[ -f "${SOURCE_DIR}/systemd/cirrusync.service" ]] ||
-                die "managed source is missing; choose update first"
+                die "managed source is missing; choose upgrade first"
             begin_transaction
             create_service_account
             secure_existing_configuration_files
@@ -2775,7 +3266,7 @@ main() {
             [[ -f "${CONFIG_PATH}" ]] ||
                 die "cannot reinstall the unit because ${CONFIG_PATH} is missing"
             [[ -f "${SOURCE_DIR}/systemd/cirrusync.service" ]] ||
-                die "managed source is missing; choose update first"
+                die "managed source is missing; choose upgrade first"
             begin_transaction
             create_service_account
             secure_existing_configuration_files

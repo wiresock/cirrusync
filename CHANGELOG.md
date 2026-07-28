@@ -6,6 +6,30 @@ All notable changes to Cirrusync are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-28
+
+### Added
+
+- Strict, monotonic `MAJOR.MINOR.PATCH` version validation for pull requests,
+  with semantic TOML validation and `Cargo.toml` as the version source of
+  truth.
+- Version-aware bootstrap upgrades that distinguish newer, equal, and older
+  source versions before replacing an installed binary.
+- Regression coverage and user documentation for the existing
+  `cirrusync --version` interface.
+
+### Changed
+
+- `bootstrap.sh --upgrade` is the primary upgrade command;
+  `bootstrap.sh --update` remains a compatibility alias.
+- Equal-version upgrades now repair missing or drifted runtime files,
+  permissions, service identity, and systemd configuration instead of
+  returning a false no-op.
+- Contributor and release documentation now describes version selection,
+  lockfile synchronization, and downgrade prevention.
+
+## [0.1.0] - 2026-07-24
+
 ### Added
 
 - Initial Cloudflare Dynamic DNS daemon with one-shot, validation, and
@@ -43,4 +67,6 @@ All notable changes to Cirrusync are documented here. The format follows
 - Authentication aborts report their root cause without derivative DNS-edit
   permission failures.
 
-[Unreleased]: https://github.com/wiresock/cirrusync/commits/main
+[Unreleased]: https://github.com/wiresock/cirrusync/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/wiresock/cirrusync/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/wiresock/cirrusync/releases/tag/v0.1.0
