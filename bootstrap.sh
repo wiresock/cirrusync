@@ -935,7 +935,15 @@ read_service_enablement() {
                 return 1
             printf '%s' "${inferred_enablement}"
         else
-            printf '%s' disabled
+            enable_state="$(
+                systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null
+            )" || true
+            case "${enable_state}" in
+                enabled | enabled-runtime | disabled)
+                    printf '%s' "${enable_state}"
+                    ;;
+                *) return 1 ;;
+            esac
         fi
         return 0
     fi

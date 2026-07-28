@@ -893,6 +893,7 @@ test_service_state_queries_fail_closed() {
             esac
         }
         expect_failure "unknown systemd activity state" read_service_activity
+        rm -f -- "${UNIT_PATH}"
     ) || fail "an unknown systemd activity state was accepted"
 
     (
@@ -912,6 +913,40 @@ test_service_state_queries_fail_closed() {
     ) || fail "an absent unit with empty is-enabled output was not treated as disabled"
 
     (
+        local enablement=""
+
+        mkdir -p -- "${UNIT_PATH%/*}"
+        : >"${UNIT_PATH}"
+        systemctl() {
+            case "$1" in
+                show) printf 'not-found\n' ;;
+                is-enabled) printf 'enabled\n' ;;
+                *) return 1 ;;
+            esac
+        }
+        enablement="$(read_service_enablement)"
+        rm -f -- "${UNIT_PATH}"
+        [[ "${enablement}" == enabled ]]
+    ) || fail "a stale not-found load state lost an existing unit's enablement"
+
+    (
+        mkdir -p -- "${UNIT_PATH%/*}"
+        : >"${UNIT_PATH}"
+        systemctl() {
+            case "$1" in
+                show) printf 'not-found\n' ;;
+                is-enabled) return 1 ;;
+                *) return 1 ;;
+            esac
+        }
+        expect_failure "unknown enablement for a stale not-found unit" \
+            read_service_enablement
+        rm -f -- "${UNIT_PATH}"
+    ) || fail "an unknown stale-cache enablement state was accepted"
+
+    (
+        mkdir -p -- "${UNIT_PATH%/*}"
+        : >"${UNIT_PATH}"
         systemctl() {
             case "$1" in
                 show) printf 'loaded\n' ;;
@@ -943,6 +978,8 @@ test_service_state_queries_fail_closed() {
     ) || fail "an inconsistent loaded/not-found unit state was accepted"
 
     (
+        local enablement=""
+
         mkdir -p -- "${PERSISTENT_ENABLEMENT_PATH%/*}"
         ln -s -- ../cirrusync.service "${PERSISTENT_ENABLEMENT_PATH}"
         systemctl() {
@@ -955,11 +992,14 @@ test_service_state_queries_fail_closed() {
                 *) return 1 ;;
             esac
         }
-        [[ "$(read_service_enablement)" == enabled ]]
+        enablement="$(read_service_enablement)"
         rm -f -- "${PERSISTENT_ENABLEMENT_PATH}"
+        [[ "${enablement}" == enabled ]]
     ) || fail "a missing loaded unit lost its persistent enablement state"
 
     (
+        local enablement=""
+
         mkdir -p -- "${RUNTIME_ENABLEMENT_PATH%/*}"
         ln -s -- "${UNIT_PATH}" "${RUNTIME_ENABLEMENT_PATH}"
         systemctl() {
@@ -969,8 +1009,9 @@ test_service_state_queries_fail_closed() {
                 *) return 1 ;;
             esac
         }
-        [[ "$(read_service_enablement)" == enabled-runtime ]]
+        enablement="$(read_service_enablement)"
         rm -f -- "${RUNTIME_ENABLEMENT_PATH}"
+        [[ "${enablement}" == enabled-runtime ]]
     ) || fail "a missing loaded unit lost its runtime enablement state"
 
     (
@@ -1007,6 +1048,8 @@ test_service_state_queries_fail_closed() {
     ) || fail "a mutable enablement-link indirection was trusted"
 
     (
+        local enablement=""
+
         mkdir -p -- "${PERSISTENT_ENABLEMENT_PATH%/*}"
         ln -s -- ../cirrusync.service "${PERSISTENT_ENABLEMENT_PATH}"
         systemctl() {
@@ -1015,11 +1058,14 @@ test_service_state_queries_fail_closed() {
                 *) return 1 ;;
             esac
         }
-        [[ "$(read_service_enablement)" == enabled ]]
+        enablement="$(read_service_enablement)"
         rm -f -- "${PERSISTENT_ENABLEMENT_PATH}"
+        [[ "${enablement}" == enabled ]]
     ) || fail "a forgotten unit lost its persistent enablement state"
 
     (
+        local enablement=""
+
         mkdir -p -- "${RUNTIME_ENABLEMENT_PATH%/*}"
         ln -s -- "${UNIT_PATH}" "${RUNTIME_ENABLEMENT_PATH}"
         systemctl() {
@@ -1028,8 +1074,9 @@ test_service_state_queries_fail_closed() {
                 *) return 1 ;;
             esac
         }
-        [[ "$(read_service_enablement)" == enabled-runtime ]]
+        enablement="$(read_service_enablement)"
         rm -f -- "${RUNTIME_ENABLEMENT_PATH}"
+        [[ "${enablement}" == enabled-runtime ]]
     ) || fail "a forgotten unit lost its runtime enablement state"
 
     (
