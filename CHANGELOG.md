@@ -6,6 +6,13 @@ All notable changes to Cirrusync are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-29
+
+### Fixed
+
+- Installer help now uses `sudo bash ./cirrusync-install.sh`, matching the
+  documented `curl -o` download flow without requiring `chmod +x`.
+
 ## [0.2.0] - 2026-07-29
 
 ### Changed
@@ -81,7 +88,8 @@ All notable changes to Cirrusync are documented here. The format follows
 - Authentication aborts report their root cause without derivative DNS-edit
   permission failures.
 
-[Unreleased]: https://github.com/wiresock/cirrusync/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/wiresock/cirrusync/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/wiresock/cirrusync/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wiresock/cirrusync/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/wiresock/cirrusync/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/wiresock/cirrusync/releases/tag/v0.1.0
