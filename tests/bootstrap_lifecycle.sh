@@ -678,7 +678,7 @@ run_failed_fresh_install_and_verify_rollback() {
         CIRRUSYNC_INTERVAL=60 \
         CIRRUSYNC_CREATE=false \
         CIRRUSYNC_PROXIED=false \
-        bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+        bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --non-interactive \
@@ -721,7 +721,7 @@ run_install() {
         CIRRUSYNC_INTERVAL=60 \
         CIRRUSYNC_CREATE=false \
         CIRRUSYNC_PROXIED=false \
-        bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+        bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --non-interactive \
@@ -800,7 +800,7 @@ run_prebuild_boundary_checks() {
     local token_hash=""
 
     "${SUDO[@]}" chmod 0644 "${TOKEN_PATH}"
-    if "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    if "${SUDO[@]}" bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --non-interactive \
@@ -816,7 +816,7 @@ run_prebuild_boundary_checks() {
         fail "pre-build token rejection disturbed the active service"
 
     "${SUDO[@]}" chmod 4755 "${BINARY_PATH}"
-    if "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    if "${SUDO[@]}" bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --non-interactive \
         --reconfigure >"${failure_log}" 2>&1; then
         fail "installer accepted a set-ID managed executable"
@@ -848,7 +848,7 @@ run_prebuild_boundary_checks() {
         CIRRUSYNC_INTERVAL=60 \
         CIRRUSYNC_CREATE=false \
         CIRRUSYNC_PROXIED=false \
-        bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+        bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --non-interactive \
         --reconfigure >"${failure_log}" 2>&1; then
         reconfigure_succeeded=true
@@ -911,7 +911,7 @@ run_upgrade_and_fsmonitor_check() {
 
     advance_fixture_repository_version
 
-    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --non-interactive \
@@ -954,7 +954,7 @@ run_upgrade_and_fsmonitor_check() {
         "${invocation_before}" =~ ^[0-9a-fA-F]{32}$ ]] ||
         fail "service identity was invalid before the no-op upgrade"
 
-    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --non-interactive \
@@ -991,7 +991,7 @@ run_upgrade_and_fsmonitor_check() {
     "${SUDO[@]}" chown root:root "${CONFIG_PATH}" "${TOKEN_PATH}"
     "${SUDO[@]}" chmod 0600 "${CONFIG_PATH}" "${TOKEN_PATH}"
 
-    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --non-interactive \
@@ -1018,7 +1018,7 @@ run_upgrade_and_fsmonitor_check() {
         fail "runtime repair did not leave the service active"
 
     "${SUDO[@]}" rm -f -- "${TOKEN_PATH}" "${UNIT_PATH}"
-    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    if ! "${SUDO[@]}" bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --config "${CONFIG_PATH}" \
@@ -1045,7 +1045,7 @@ run_upgrade_and_fsmonitor_check() {
     invocation_before="$("${SUDO[@]}" systemctl show \
         --property=InvocationID --value cirrusync.service)"
     publish_fixture_downgrade
-    if "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    if "${SUDO[@]}" bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --repo "${REPOSITORY_URL}" \
         --branch "${INTEGRATION_BRANCH}" \
         --non-interactive \
@@ -1090,7 +1090,7 @@ run_failed_reconfigure_and_verify_rollback() {
         CIRRUSYNC_ZONE="failure.test" \
         CIRRUSYNC_ACCOUNT_ID="${ACCOUNT_ID}" \
         CIRRUSYNC_RECORD="host.failure.test" \
-        bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+        bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --non-interactive \
         --reconfigure >"${failure_log}" 2>&1; then
         fail "reconfiguration unexpectedly passed against a missing zone"
@@ -1113,7 +1113,7 @@ run_failed_reconfigure_and_verify_rollback() {
 }
 
 run_noninteractive_uninstall() {
-    "${SUDO[@]}" bash "${REPOSITORY_ROOT}/bootstrap.sh" \
+    "${SUDO[@]}" bash "${REPOSITORY_ROOT}/cirrusync-install.sh" \
         --config "${CONFIG_PATH}" \
         --non-interactive \
         --uninstall

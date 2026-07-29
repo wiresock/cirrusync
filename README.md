@@ -47,7 +47,7 @@ publishing a fork.
 
 Cirrusync targets Debian 12, Ubuntu 22.04, Ubuntu 24.04, and reasonably
 compatible Debian-based distributions on `amd64` and `arm64`. The Rust daemon
-itself is portable; the bootstrap and service integration are Linux-specific.
+itself is portable; the installer and service integration are Linux-specific.
 
 ## How it works
 
@@ -58,7 +58,7 @@ itself is portable; the bootstrap and service integration are Linux-specific.
 | `cloudflare` | Authenticates, performs pagination-safe exact lookups, and creates or updates records through API v4. |
 | `updater` | Runs one non-overlapping discovery/compare/update cycle and aggregates per-record results. |
 | `daemon` | Schedules cycles, applies bounded retry/backoff, and handles shutdown signals. |
-| `bootstrap.sh` | Builds in an unprivileged context, validates configuration, installs atomically, and manages systemd. |
+| `cirrusync-install.sh` | Builds in an unprivileged context, validates configuration, installs atomically, and manages systemd. |
 
 Cloudflare remains the authoritative state. Cirrusync does not rely on a local
 address cache after restart.
@@ -166,16 +166,16 @@ Downloading and reviewing a privileged installer is safer than piping it
 directly to a shell:
 
 ```console
-curl -fsSLo bootstrap.sh \
-  https://raw.githubusercontent.com/wiresock/cirrusync/main/bootstrap.sh
-less bootstrap.sh
-sudo bash bootstrap.sh
+curl -fsSLo cirrusync-install.sh \
+  https://raw.githubusercontent.com/wiresock/cirrusync/main/cirrusync-install.sh
+less cirrusync-install.sh
+sudo bash cirrusync-install.sh
 ```
 
 The compact one-command form is:
 
 ```console
-curl -fsSL https://raw.githubusercontent.com/wiresock/cirrusync/main/bootstrap.sh \
+curl -fsSL https://raw.githubusercontent.com/wiresock/cirrusync/main/cirrusync-install.sh \
   | sudo bash
 ```
 
@@ -269,7 +269,7 @@ sudo CIRRUSYNC_ZONE=example.com \
   CIRRUSYNC_ENABLE_IPV4=true \
   CIRRUSYNC_ENABLE_IPV6=false \
   CIRRUSYNC_INTERVAL=300 \
-  bash bootstrap.sh \
+  bash cirrusync-install.sh \
     --token-file /root/cirrusync-token \
     --non-interactive
 ```
@@ -576,10 +576,16 @@ rustls must continue to work.
 Download and review the new installer, then:
 
 ```console
-sudo bash bootstrap.sh \
+sudo bash cirrusync-install.sh \
   --branch main \
   --upgrade
 ```
+
+An already-downloaded and reviewed `0.1.x` `bootstrap.sh` can perform the
+one-time upgrade. Automation that downloads the installer from GitHub must
+switch to the new raw URL above. After a successful `0.2.0` or newer
+installation, the managed copy is available at
+`/usr/local/src/cirrusync/cirrusync-install.sh`.
 
 `--update` remains a compatibility alias for `--upgrade`. The installer
 compares the selected source version with `/usr/local/bin/cirrusync --version`
@@ -620,14 +626,14 @@ For an automated configuration change:
 sudo CIRRUSYNC_ZONE=example.com \
   CIRRUSYNC_RECORD=home.example.com \
   CIRRUSYNC_ENABLE_IPV4=true \
-  bash bootstrap.sh --reconfigure --non-interactive
+  bash cirrusync-install.sh --reconfigure --non-interactive
 ```
 
 Interactive reruns offer binary upgrade, reconfiguration, unit reinstall, and
 uninstall. To uninstall directly:
 
 ```console
-sudo bash bootstrap.sh --uninstall
+sudo bash cirrusync-install.sh --uninstall
 ```
 
 The service, unit, and binary are removed. Configuration, token, service
@@ -677,7 +683,7 @@ Common causes:
 - **Web works but SSH/VPN does not:** set the record to DNS only. Cloudflare's
   standard proxy is not a general-purpose TCP/UDP forwarder.
 - **Service sandbox failure after customization:** inspect the journal. A
-  custom configuration path may need a systemd override; the bootstrap creates
+  custom configuration path may need a systemd override; the installer creates
   one when `--config` is used.
 
 DNS caches respect TTL, so clients may briefly retain the previous address
@@ -719,7 +725,7 @@ cargo build --release --locked
 python3 scripts/versioning.py validate
 python3 -m unittest tests/test_versioning.py -v
 shellcheck --severity=warning \
-  bootstrap.sh \
+  cirrusync-install.sh \
   tests/bootstrap_static.sh \
   tests/bootstrap_functions.sh \
   tests/bootstrap_fsmonitor_probe.sh \

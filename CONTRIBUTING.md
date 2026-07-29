@@ -18,7 +18,7 @@ cargo build --release --locked
 python3 scripts/versioning.py validate
 python3 -m unittest tests/test_versioning.py -v
 shellcheck --severity=warning \
-  bootstrap.sh \
+  cirrusync-install.sh \
   tests/bootstrap_static.sh \
   tests/bootstrap_functions.sh \
   tests/bootstrap_fsmonitor_probe.sh \
@@ -46,9 +46,10 @@ version must have greater semantic precedence than the target branch:
 - equal versions and downgrades are rejected;
 - prerelease identifiers, build metadata, a leading `v`, missing components,
   and leading zeroes are not accepted;
-- use a patch increment for compatible fixes and documentation, a minor
-  increment for compatible functionality, and a major increment for an
-  incompatible release.
+- use a patch increment for compatible fixes and documentation; use a minor
+  increment for compatible functionality and for incompatible changes while
+  the major version is `0`; use a major increment when declaring `1.0.0` or
+  making an incompatible change after `1.0.0`.
 
 Rebase or merge the latest target branch before choosing the version. This
 prevents two concurrent pull requests from reusing the same next version.

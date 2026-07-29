@@ -13,8 +13,8 @@ readonly BOOTSTRAP_TEST_ROOT
 export CIRRUSYNC_BOOTSTRAP_TEST_ROOT="${BOOTSTRAP_TEST_ROOT}"
 trap 'rm -rf -- "${BOOTSTRAP_TEST_ROOT}"' EXIT
 
-# shellcheck source=../bootstrap.sh
-source "${REPOSITORY_ROOT}/bootstrap.sh"
+# shellcheck source=../cirrusync-install.sh
+source "${REPOSITORY_ROOT}/cirrusync-install.sh"
 unset CIRRUSYNC_BOOTSTRAP_TEST_ROOT
 
 fail() {
@@ -22,9 +22,9 @@ fail() {
     exit 1
 }
 
-bash "${REPOSITORY_ROOT}/bootstrap.sh" --help >/dev/null ||
+bash "${REPOSITORY_ROOT}/cirrusync-install.sh" --help >/dev/null ||
     fail "direct --help execution failed"
-bash -s -- --help <"${REPOSITORY_ROOT}/bootstrap.sh" >/dev/null ||
+bash -s -- --help <"${REPOSITORY_ROOT}/cirrusync-install.sh" >/dev/null ||
     fail "piped --help execution failed"
 
 expect_failure() {
@@ -640,7 +640,7 @@ test_service_health_sampling() {
             esac
         }
         service_remains_healthy 3 0
-    ' _ "${REPOSITORY_ROOT}/bootstrap.sh" "${restart_counter}"; then
+    ' _ "${REPOSITORY_ROOT}/cirrusync-install.sh" "${restart_counter}"; then
         rm -f -- "${restart_counter}"
         fail "restart during health window: command unexpectedly succeeded"
     fi

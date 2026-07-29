@@ -8,7 +8,7 @@ requires every pull request targeting `main` to advance the software version.
 The `[package].version` value in the repository's root `Cargo.toml` is
 canonical. The root `cirrusync` package entry in `Cargo.lock` is a generated
 mirror and must match it. Do not add a separate version file or hard-code a
-version in Rust or `bootstrap.sh`.
+version in Rust or `cirrusync-install.sh`.
 
 The Rust build exposes the canonical package version through
 `CARGO_PKG_VERSION`, which Clap uses for:
@@ -50,8 +50,10 @@ same pull request.
 Choose the increment according to the change:
 
 - **patch** for compatible fixes, maintenance, documentation, and CI changes;
-- **minor** for backward-compatible functionality;
-- **major** for an incompatible release.
+- **minor** for backward-compatible functionality and for incompatible changes
+  while the major version is `0`;
+- **major** when declaring the first stable `1.0.0` interface or making an
+  incompatible change after `1.0.0`.
 
 Before selecting a version, update the branch from its target branch. If two
 pull requests choose the same next version, the later one must update its base
@@ -95,12 +97,12 @@ and pushes it. A tag must never be moved or reused. Tags identify reviewed
 source states; they do not currently publish prebuilt binaries or a GitHub
 Release automatically.
 
-## Bootstrap upgrade behavior
+## Installer upgrade behavior
 
 Use the version-aware upgrade action:
 
 ```console
-sudo bash bootstrap.sh --upgrade
+sudo bash cirrusync-install.sh --upgrade
 ```
 
 `--update` is retained as a compatibility alias. The installer compares the
