@@ -576,7 +576,7 @@ usage() {
 Cirrusync installer
 
 Usage:
-  sudo ./cirrusync-install.sh [options]
+  sudo bash ./cirrusync-install.sh [options]
   curl -fsSL https://raw.githubusercontent.com/wiresock/cirrusync/main/cirrusync-install.sh |
     sudo bash -s -- [options]
 

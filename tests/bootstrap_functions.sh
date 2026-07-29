@@ -22,10 +22,18 @@ fail() {
     exit 1
 }
 
-bash "${REPOSITORY_ROOT}/cirrusync-install.sh" --help >/dev/null ||
-    fail "direct --help execution failed"
-bash -s -- --help <"${REPOSITORY_ROOT}/cirrusync-install.sh" >/dev/null ||
-    fail "piped --help execution failed"
+help_output="$(
+    bash "${REPOSITORY_ROOT}/cirrusync-install.sh" --help
+)" || fail "direct --help execution failed"
+[[ "${help_output}" == *"sudo bash ./cirrusync-install.sh [options]"* ]] ||
+    fail "direct --help omitted the non-executable download invocation"
+[[ "${help_output}" != *"sudo ./cirrusync-install.sh [options]"* ]] ||
+    fail "direct --help requires an executable bit after download"
+piped_help_output="$(
+    bash -s -- --help <"${REPOSITORY_ROOT}/cirrusync-install.sh"
+)" || fail "piped --help execution failed"
+[[ "${piped_help_output}" == "${help_output}" ]] ||
+    fail "direct and piped --help output diverged"
 
 expect_failure() {
     local description="$1"
