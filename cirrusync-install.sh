@@ -46,7 +46,7 @@ readonly CONFIG_ROOT="${BOOTSTRAP_ROOT}/etc/cirrusync"
 readonly DEFAULT_CONFIG_PATH="${CONFIG_ROOT}/config.toml"
 readonly DEFAULT_REPOSITORY="https://github.com/wiresock/cirrusync.git"
 readonly INSTALL_LOCK_PATH="${BOOTSTRAP_ROOT}/run/cirrusync-bootstrap.lock"
-# The bootstrap may build an arbitrary --repo as an unprivileged user, but it
+# The installer may build an arbitrary --repo as an unprivileged user, but it
 # must never install repository-controlled service privileges as root.
 readonly SYSTEMD_UNIT_SHA256="9cdb70fe14082a829cfe06633d4a330b4c7e445bebe218fce947dd19d2b3b65a"
 
@@ -573,11 +573,11 @@ fi
 
 usage() {
     cat <<'EOF'
-Cirrusync bootstrap installer
+Cirrusync installer
 
 Usage:
-  sudo ./bootstrap.sh [options]
-  curl -fsSL https://raw.githubusercontent.com/wiresock/cirrusync/main/bootstrap.sh |
+  sudo ./cirrusync-install.sh [options]
+  curl -fsSL https://raw.githubusercontent.com/wiresock/cirrusync/main/cirrusync-install.sh |
     sudo bash -s -- [options]
 
 Options:
@@ -3240,10 +3240,10 @@ Full permission check (the service owns the same resource locks):
   sudo systemctl start ${SERVICE_NAME}
 
 Upgrade:
-  sudo ./bootstrap.sh --repo '${REPO_URL}' --branch '${BRANCH}' --config '${CONFIG_PATH}' --upgrade
+  sudo bash '${SOURCE_DIR}/cirrusync-install.sh' --repo '${REPO_URL}' --branch '${BRANCH}' --config '${CONFIG_PATH}' --upgrade
 
 Uninstall (configuration and secrets are kept by default):
-  sudo ./bootstrap.sh --config '${CONFIG_PATH}' --uninstall
+  sudo bash '${SOURCE_DIR}/cirrusync-install.sh' --config '${CONFIG_PATH}' --uninstall
 EOF
 }
 

@@ -8,7 +8,7 @@ REPOSITORY_ROOT="$(
     pwd -P
 )"
 readonly REPOSITORY_ROOT
-readonly BOOTSTRAP="${REPOSITORY_ROOT}/bootstrap.sh"
+readonly BOOTSTRAP="${REPOSITORY_ROOT}/cirrusync-install.sh"
 readonly UNIT="${REPOSITORY_ROOT}/systemd/cirrusync.service"
 
 fail() {
@@ -34,6 +34,17 @@ assert_not_contains() {
 }
 
 bash -n "${BOOTSTRAP}"
+[[ -x "${BOOTSTRAP}" ]] ||
+    fail "cirrusync-install.sh is not executable"
+[[ ! -e "${REPOSITORY_ROOT}/bootstrap.sh" &&
+    ! -L "${REPOSITORY_ROOT}/bootstrap.sh" ]] ||
+    fail "the generic bootstrap.sh installer name was reintroduced"
+assert_contains "${BOOTSTRAP}" \
+    'https://raw.githubusercontent.com/wiresock/cirrusync/main/cirrusync-install.sh'
+assert_not_contains "${BOOTSTRAP}" \
+    'https://raw.githubusercontent.com/wiresock/cirrusync/main/bootstrap.sh'
+assert_contains "${BOOTSTRAP}" \
+    "sudo bash '\${SOURCE_DIR}/cirrusync-install.sh'"
 
 assert_contains "${BOOTSTRAP}" 'readonly BUILD_USER="cirrusync-build"'
 assert_contains "${BOOTSTRAP}" 'readonly TRUSTED_PATH='
