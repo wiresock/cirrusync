@@ -6,7 +6,7 @@ All notable changes to Cirrusync are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.2.2] - 2026-10-14
+## [0.2.2] - 2026-10-15
 
 ### Security
 
