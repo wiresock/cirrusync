@@ -6,6 +6,23 @@ All notable changes to Cirrusync are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-15
+
+### Security
+
+- Update the locked `h2` dependency to 0.4.16 to address unbounded empty
+  HTTP/2 DATA frames (RUSTSEC-2026-0258).
+- Update `rustls` to 0.23.46 to enforce TLS 1.3 encryption-level boundaries
+  (RUSTSEC-2026-0285) and include the additional security fixes published
+  on 2026-10-14 (RUSTSEC-2026-0346 through RUSTSEC-2026-0349), with its
+  required `rustls-webpki` update to 0.103.14.
+- Update the locked optional `quinn-proto` dependency to 0.11.18 to include
+  the current QUIC denial-of-service fixes (RUSTSEC-2026-0338 through
+  RUSTSEC-2026-0343). HTTP/3 remains disabled in Cirrusync's configured
+  feature set.
+- Replace the yanked optional `chacha20` 0.10.1 dependency with 0.10.2,
+  which fixes an RNG/legacy-cipher SSE2 backend instruction mismatch.
+
 ## [0.2.1] - 2026-07-29
 
 ### Fixed
